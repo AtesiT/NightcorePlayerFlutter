@@ -1,0 +1,28 @@
+name: nightcore_player_flutter
+description: A compact music player with real-time speed and pitch control for Nightcore-style effects.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Audio playback engine with speed/pitch support
+  just_audio: ^0.9.40
+
+  # File picking for local audio files
+  file_picker: ^8.1.2
+
+  # Cupertino icons (default Flutter asset, keep for iOS-style icons if needed)
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
