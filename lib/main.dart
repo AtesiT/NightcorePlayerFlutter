@@ -1,3 +1,4 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 void main() {
@@ -12,6 +13,10 @@ class AppColors {
   static const textPrimary = Colors.white;
   static const textSecondary = Color(0xFFB3B3B3);
 }
+
+const List<String> kSupportedAudioExtensions = [
+  'mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac',
+];
 
 class NightcorePlayerApp extends StatelessWidget {
   const NightcorePlayerApp({super.key});
@@ -63,10 +68,7 @@ class RootShell extends StatefulWidget {
 class _RootShellState extends State<RootShell> {
   int _selectedIndex = 0;
 
-  static const List<Widget> _tabs = [
-    PlayerScreen(),
-    QueueScreen(),
-  ];
+  final List<PlatformFile> _queue = [];
 
   void _onTabTapped(int index) {
     setState(() {
@@ -74,10 +76,37 @@ class _RootShellState extends State<RootShell> {
     });
   }
 
+  Future<void> _pickAudioFiles() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: kSupportedAudioExtensions,
+        allowMultiple: true,
+      );
+
+      // result is null if the user cancelled the picker.
+      if (result == null || result.files.isEmpty) return;
+
+      setState(() {
+        _queue.addAll(result.files);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to pick files: $e')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final tabs = [
+      PlayerScreen(currentTrackName: _queue.isNotEmpty ? _queue.first.name : null),
+      QueueScreen(queue: _queue, onAddPressed: _pickAudioFiles),
+    ];
+
     return Scaffold(
-      body: SafeArea(child: _tabs[_selectedIndex]),
+      body: SafeArea(child: tabs[_selectedIndex]),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,
         onTap: _onTabTapped,
@@ -99,10 +128,14 @@ class _RootShellState extends State<RootShell> {
 }
 
 class PlayerScreen extends StatelessWidget {
-  const PlayerScreen({super.key});
+  final String? currentTrackName;
+
+  const PlayerScreen({super.key, this.currentTrackName});
 
   @override
   Widget build(BuildContext context) {
+    final hasTrack = currentTrackName != null;
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
       child: Column(
@@ -110,7 +143,6 @@ class PlayerScreen extends StatelessWidget {
         children: [
           const Spacer(flex: 2),
 
-          // Album art placeholder
           Container(
             width: 260,
             height: 260,
@@ -134,10 +166,11 @@ class PlayerScreen extends StatelessWidget {
 
           const Spacer(flex: 1),
 
-          // Track title & artist placeholders
-          const Text(
-            'No track loaded',
-            style: TextStyle(
+          Text(
+            hasTrack ? currentTrackName! : 'No track loaded',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
               color: AppColors.textPrimary,
               fontSize: 20,
               fontWeight: FontWeight.w600,
@@ -145,9 +178,9 @@ class PlayerScreen extends StatelessWidget {
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 6),
-          const Text(
-            'Pick a file to get started',
-            style: TextStyle(
+          Text(
+            hasTrack ? 'Ready to load (Phase 4)' : 'Pick a file to get started',
+            style: const TextStyle(
               color: AppColors.textSecondary,
               fontSize: 14,
             ),
@@ -156,7 +189,6 @@ class PlayerScreen extends StatelessWidget {
 
           const SizedBox(height: 24),
 
-          // Progress bar placeholder (disabled, static for now)
           Column(
             children: [
               SliderTheme(
@@ -184,12 +216,11 @@ class PlayerScreen extends StatelessWidget {
 
           const SizedBox(height: 12),
 
-          // Playback controls row (visual only — wired up in Phase 5)
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              Icon(Icons.shuffle, color: AppColors.textSecondary, size: 24),
-              Icon(Icons.skip_previous_rounded, color: AppColors.textPrimary, size: 36),
+              const Icon(Icons.shuffle, color: AppColors.textSecondary, size: 24),
+              const Icon(Icons.skip_previous_rounded, color: AppColors.textPrimary, size: 36),
               Container(
                 width: 64,
                 height: 64,
@@ -199,8 +230,8 @@ class PlayerScreen extends StatelessWidget {
                 ),
                 child: const Icon(Icons.play_arrow_rounded, color: Colors.black, size: 36),
               ),
-              Icon(Icons.skip_next_rounded, color: AppColors.textPrimary, size: 36),
-              Icon(Icons.repeat, color: AppColors.textSecondary, size: 24),
+              const Icon(Icons.skip_next_rounded, color: AppColors.textPrimary, size: 36),
+              const Icon(Icons.repeat, color: AppColors.textSecondary, size: 24),
             ],
           ),
 
@@ -212,41 +243,112 @@ class PlayerScreen extends StatelessWidget {
 }
 
 class QueueScreen extends StatelessWidget {
-  const QueueScreen({super.key});
+  final List<PlatformFile> queue;
+  final VoidCallback onAddPressed;
+
+  const QueueScreen({
+    super.key,
+    required this.queue,
+    required this.onAddPressed,
+  });
+
+  String _formatFileSize(int bytes) {
+    if (bytes <= 0) return '';
+    const suffixes = ['B', 'KB', 'MB', 'GB'];
+    var i = (bytes == 0) ? 0 : (bytes.bitLength - 1) ~/ 10;
+    if (i >= suffixes.length) i = suffixes.length - 1;
+    final size = bytes / (1 << (i * 10));
+    return '${size.toStringAsFixed(1)} ${suffixes[i]}';
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              'Queue',
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                    color: AppColors.textPrimary,
-                    fontWeight: FontWeight.bold,
-                  ),
-            ),
-          ),
-        ),
-        const Expanded(
-          child: Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Icon(Icons.queue_music_outlined, size: 56, color: AppColors.textSecondary),
-                SizedBox(height: 12),
                 Text(
-                  'No tracks in queue yet',
-                  style: TextStyle(color: AppColors.textSecondary, fontSize: 15),
+                  'Queue',
+                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                        color: AppColors.textPrimary,
+                        fontWeight: FontWeight.bold,
+                      ),
+                ),
+                Text(
+                  '${queue.length} track${queue.length == 1 ? '' : 's'}',
+                  style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
                 ),
               ],
             ),
           ),
-        ),
-      ],
+          Expanded(
+            child: queue.isEmpty
+                ? const _EmptyQueueState()
+                : ListView.separated(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    itemCount: queue.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 4),
+                    itemBuilder: (context, index) {
+                      final file = queue[index];
+                      return ListTile(
+                        leading: const CircleAvatar(
+                          backgroundColor: AppColors.surface,
+                          child: Icon(Icons.music_note, color: AppColors.textSecondary, size: 20),
+                        ),
+                        title: Text(
+                          file.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: AppColors.textPrimary, fontSize: 14),
+                        ),
+                        subtitle: Text(
+                          _formatFileSize(file.size),
+                          style: const TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: onAddPressed,
+        backgroundColor: AppColors.accentGreen,
+        foregroundColor: Colors.black,
+        icon: const Icon(Icons.add),
+        label: const Text('Add Tracks'),
+      ),
+    );
+  }
+}
+
+class _EmptyQueueState extends StatelessWidget {
+  const _EmptyQueueState();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.queue_music_outlined, size: 56, color: AppColors.textSecondary),
+          SizedBox(height: 12),
+          Text(
+            'No tracks in queue yet',
+            style: TextStyle(color: AppColors.textSecondary, fontSize: 15),
+          ),
+          SizedBox(height: 4),
+          Text(
+            'Tap "Add Tracks" to pick audio files',
+            style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
+          ),
+        ],
+      ),
     );
   }
 }
