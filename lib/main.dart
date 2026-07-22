@@ -1,5 +1,6 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
 
 void main() {
   runApp(const NightcorePlayerApp());
@@ -18,6 +19,7 @@ const List<String> kSupportedAudioExtensions = [
   'mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac',
 ];
 
+/// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
   const NightcorePlayerApp({super.key});
 
@@ -70,6 +72,18 @@ class _RootShellState extends State<RootShell> {
 
   final List<PlatformFile> _queue = [];
 
+  final AudioPlayer _player = AudioPlayer();
+
+  int? _currentIndex;
+
+  bool _isLoading = false;
+
+  @override
+  void dispose() {
+    _player.dispose();
+    super.dispose();
+  }
+
   void _onTabTapped(int index) {
     setState(() {
       _selectedIndex = index;
@@ -78,6 +92,8 @@ class _RootShellState extends State<RootShell> {
 
   Future<void> _pickAudioFiles() async {
     try {
+      final wasQueueEmpty = _queue.isEmpty;
+
       final result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: kSupportedAudioExtensions,
@@ -90,19 +106,68 @@ class _RootShellState extends State<RootShell> {
       setState(() {
         _queue.addAll(result.files);
       });
+
+      if (wasQueueEmpty) {
+        await _loadTrack(0);
+      }
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to pick files: $e')),
-      );
+      _showError('Failed to pick files: $e');
     }
+  }
+
+  /// Loads the track at [index] into the audio engine.
+  Future<void> _loadTrack(int index) async {
+    if (index < 0 || index >= _queue.length) return;
+
+    final file = _queue[index];
+    final path = file.path;
+
+    if (path == null) {
+      _showError('Could not resolve a file path for "${file.name}".');
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _currentIndex = index;
+    });
+
+    try {
+      await _player.setFilePath(path);
+    } catch (e) {
+      _showError('Failed to load "${file.name}": $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  void _showError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final currentFile = _currentIndex != null ? _queue[_currentIndex!] : null;
+
     final tabs = [
-      PlayerScreen(currentTrackName: _queue.isNotEmpty ? _queue.first.name : null),
-      QueueScreen(queue: _queue, onAddPressed: _pickAudioFiles),
+      PlayerScreen(
+        currentTrackName: currentFile?.name,
+        isLoading: _isLoading,
+      ),
+      QueueScreen(
+        queue: _queue,
+        currentIndex: _currentIndex,
+        isLoading: _isLoading,
+        onAddPressed: _pickAudioFiles,
+        onTrackTapped: _loadTrack,
+      ),
     ];
 
     return Scaffold(
@@ -129,12 +194,26 @@ class _RootShellState extends State<RootShell> {
 
 class PlayerScreen extends StatelessWidget {
   final String? currentTrackName;
+  final bool isLoading;
 
-  const PlayerScreen({super.key, this.currentTrackName});
+  const PlayerScreen({
+    super.key,
+    this.currentTrackName,
+    this.isLoading = false,
+  });
 
   @override
   Widget build(BuildContext context) {
     final hasTrack = currentTrackName != null;
+
+    String statusText;
+    if (!hasTrack) {
+      statusText = 'Pick a file to get started';
+    } else if (isLoading) {
+      statusText = 'Loading...';
+    } else {
+      statusText = 'Loaded — ready to play (Phase 5)';
+    }
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -157,10 +236,14 @@ class PlayerScreen extends StatelessWidget {
                 ),
               ],
             ),
-            child: const Icon(
-              Icons.music_note_rounded,
-              size: 100,
-              color: AppColors.textSecondary,
+            child: Center(
+              child: isLoading
+                  ? const CircularProgressIndicator(color: AppColors.accentGreen)
+                  : const Icon(
+                      Icons.music_note_rounded,
+                      size: 100,
+                      color: AppColors.textSecondary,
+                    ),
             ),
           ),
 
@@ -179,7 +262,7 @@ class PlayerScreen extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           Text(
-            hasTrack ? 'Ready to load (Phase 4)' : 'Pick a file to get started',
+            statusText,
             style: const TextStyle(
               color: AppColors.textSecondary,
               fontSize: 14,
@@ -244,12 +327,18 @@ class PlayerScreen extends StatelessWidget {
 
 class QueueScreen extends StatelessWidget {
   final List<PlatformFile> queue;
+  final int? currentIndex;
+  final bool isLoading;
   final VoidCallback onAddPressed;
+  final ValueChanged<int> onTrackTapped;
 
   const QueueScreen({
     super.key,
     required this.queue,
+    required this.currentIndex,
+    required this.isLoading,
     required this.onAddPressed,
+    required this.onTrackTapped,
   });
 
   String _formatFileSize(int bytes) {
@@ -295,16 +384,43 @@ class QueueScreen extends StatelessWidget {
                     separatorBuilder: (_, __) => const SizedBox(height: 4),
                     itemBuilder: (context, index) {
                       final file = queue[index];
+                      final isActive = index == currentIndex;
+                      final isActiveLoading = isActive && isLoading;
+
                       return ListTile(
-                        leading: const CircleAvatar(
-                          backgroundColor: AppColors.surface,
-                          child: Icon(Icons.music_note, color: AppColors.textSecondary, size: 20),
+                        onTap: () => onTrackTapped(index),
+                        selected: isActive,
+                        selectedTileColor: AppColors.surface,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        leading: CircleAvatar(
+                          backgroundColor:
+                              isActive ? AppColors.accentGreen : AppColors.surface,
+                          child: isActiveLoading
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: Colors.black,
+                                  ),
+                                )
+                              : Icon(
+                                  isActive ? Icons.graphic_eq : Icons.music_note,
+                                  color: isActive ? Colors.black : AppColors.textSecondary,
+                                  size: 20,
+                                ),
                         ),
                         title: Text(
                           file.name,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(color: AppColors.textPrimary, fontSize: 14),
+                          style: TextStyle(
+                            color: isActive ? AppColors.accentGreen : AppColors.textPrimary,
+                            fontSize: 14,
+                            fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
+                          ),
                         ),
                         subtitle: Text(
                           _formatFileSize(file.size),
