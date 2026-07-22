@@ -6,6 +6,7 @@ void main() {
   runApp(const NightcorePlayerApp());
 }
 
+// Spotify-inspired color palette, defined as constants for easy reuse.
 class AppColors {
   static const background = Color(0xFF121212);
   static const surface = Color(0xFF282828);
@@ -15,6 +16,7 @@ class AppColors {
   static const textSecondary = Color(0xFFB3B3B3);
 }
 
+// Supported audio file extensions for the picker.
 const List<String> kSupportedAudioExtensions = [
   'mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac',
 ];
@@ -60,6 +62,10 @@ class NightcorePlayerApp extends StatelessWidget {
   }
 }
 
+/// The root shell hosting the bottom navigation bar and switching between
+/// the Player tab and the Queue tab. Also owns the picked-files queue state
+/// and the audio player instance for now, since it's the shared ancestor
+/// of both tabs. Will be extracted into a dedicated controller in Phase 15.
 class RootShell extends StatefulWidget {
   const RootShell({super.key});
 
@@ -70,12 +76,17 @@ class RootShell extends StatefulWidget {
 class _RootShellState extends State<RootShell> {
   int _selectedIndex = 0;
 
+  // Holds all picked audio files. PlatformFile already gives us name, path,
+  // and size without needing a custom model class — keeps things minimal.
   final List<PlatformFile> _queue = [];
 
+  // The just_audio engine instance.
   final AudioPlayer _player = AudioPlayer();
 
+  // Index of the currently loaded track within _queue, or null if none.
   int? _currentIndex;
 
+  // True while a track is in the process of being loaded into the engine.
   bool _isLoading = false;
 
   @override
@@ -90,6 +101,9 @@ class _RootShellState extends State<RootShell> {
     });
   }
 
+  /// Opens the native file picker allowing multi-selection of audio files,
+  /// appends the results to the queue, and auto-loads the first file if
+  /// the queue was previously empty.
   Future<void> _pickAudioFiles() async {
     try {
       final wasQueueEmpty = _queue.isEmpty;
@@ -145,6 +159,26 @@ class _RootShellState extends State<RootShell> {
     }
   }
 
+  /// Toggles between play and pause. Does nothing if no track is loaded.
+  Future<void> _togglePlayPause() async {
+    if (_currentIndex == null) return;
+
+    if (_player.playing) {
+      await _player.pause();
+    } else {
+      await _player.play();
+    }
+  }
+
+  /// Stops playback: pauses and resets position to the start.
+  /// Does not unload the track. Does nothing if no track is loaded.
+  Future<void> _stopPlayback() async {
+    if (_currentIndex == null) return;
+
+    await _player.pause();
+    await _player.seek(Duration.zero);
+  }
+
   void _showError(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -160,6 +194,9 @@ class _RootShellState extends State<RootShell> {
       PlayerScreen(
         currentTrackName: currentFile?.name,
         isLoading: _isLoading,
+        player: _player,
+        onPlayPause: _togglePlayPause,
+        onStop: _stopPlayback,
       ),
       QueueScreen(
         queue: _queue,
@@ -195,25 +232,22 @@ class _RootShellState extends State<RootShell> {
 class PlayerScreen extends StatelessWidget {
   final String? currentTrackName;
   final bool isLoading;
+  final AudioPlayer player;
+  final VoidCallback onPlayPause;
+  final VoidCallback onStop;
 
   const PlayerScreen({
     super.key,
     this.currentTrackName,
     this.isLoading = false,
+    required this.player,
+    required this.onPlayPause,
+    required this.onStop,
   });
 
   @override
   Widget build(BuildContext context) {
     final hasTrack = currentTrackName != null;
-
-    String statusText;
-    if (!hasTrack) {
-      statusText = 'Pick a file to get started';
-    } else if (isLoading) {
-      statusText = 'Loading...';
-    } else {
-      statusText = 'Loaded — ready to play (Phase 5)';
-    }
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -222,6 +256,7 @@ class PlayerScreen extends StatelessWidget {
         children: [
           const Spacer(flex: 2),
 
+          // Album art placeholder
           Container(
             width: 260,
             height: 260,
@@ -249,6 +284,7 @@ class PlayerScreen extends StatelessWidget {
 
           const Spacer(flex: 1),
 
+          // Track title
           Text(
             hasTrack ? currentTrackName! : 'No track loaded',
             maxLines: 1,
@@ -261,17 +297,42 @@ class PlayerScreen extends StatelessWidget {
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 6),
-          Text(
-            statusText,
-            style: const TextStyle(
-              color: AppColors.textSecondary,
-              fontSize: 14,
-            ),
-            textAlign: TextAlign.center,
+
+          // Live status text driven by the player state stream.
+          StreamBuilder<PlayerState>(
+            stream: player.playerStateStream,
+            builder: (context, snapshot) {
+              final state = snapshot.data;
+              final playing = state?.playing ?? false;
+              final processingState = state?.processingState;
+
+              String statusText;
+              if (!hasTrack) {
+                statusText = 'Pick a file to get started';
+              } else if (isLoading) {
+                statusText = 'Loading...';
+              } else if (processingState == ProcessingState.completed) {
+                statusText = 'Finished';
+              } else if (playing) {
+                statusText = 'Now playing';
+              } else {
+                statusText = 'Paused';
+              }
+
+              return Text(
+                statusText,
+                style: const TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 14,
+                ),
+                textAlign: TextAlign.center,
+              );
+            },
           ),
 
           const SizedBox(height: 24),
 
+          // Progress bar placeholder (disabled, static for now)
           Column(
             children: [
               SliderTheme(
@@ -299,22 +360,50 @@ class PlayerScreen extends StatelessWidget {
 
           const SizedBox(height: 12),
 
+          // Playback controls row.
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              const Icon(Icons.shuffle, color: AppColors.textSecondary, size: 24),
-              const Icon(Icons.skip_previous_rounded, color: AppColors.textPrimary, size: 36),
-              Container(
-                width: 64,
-                height: 64,
-                decoration: const BoxDecoration(
-                  color: AppColors.accentGreen,
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(Icons.play_arrow_rounded, color: Colors.black, size: 36),
+              // Stop — functional, resets position and pauses.
+              IconButton(
+                onPressed: onStop,
+                icon: const Icon(Icons.stop_rounded),
+                color: AppColors.textSecondary,
+                iconSize: 26,
               ),
-              const Icon(Icons.skip_next_rounded, color: AppColors.textPrimary, size: 36),
-              const Icon(Icons.repeat, color: AppColors.textSecondary, size: 24),
+
+              // Skip previous — decorative until Phase 14.
+              const Icon(Icons.skip_previous_rounded, color: AppColors.surfaceLight, size: 36),
+
+              // Play / Pause — functional, reacts to real player state.
+              StreamBuilder<PlayerState>(
+                stream: player.playerStateStream,
+                builder: (context, snapshot) {
+                  final playing = snapshot.data?.playing ?? false;
+                  return GestureDetector(
+                    onTap: onPlayPause,
+                    child: Container(
+                      width: 64,
+                      height: 64,
+                      decoration: const BoxDecoration(
+                        color: AppColors.accentGreen,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                        color: Colors.black,
+                        size: 36,
+                      ),
+                    ),
+                  );
+                },
+              ),
+
+              // Skip next — decorative until Phase 14.
+              const Icon(Icons.skip_next_rounded, color: AppColors.surfaceLight, size: 36),
+
+              // Repeat — decorative placeholder, not part of current roadmap scope.
+              const Icon(Icons.repeat, color: AppColors.surfaceLight, size: 24),
             ],
           ),
 
@@ -341,6 +430,7 @@ class QueueScreen extends StatelessWidget {
     required this.onTrackTapped,
   });
 
+  /// Formats file size in bytes into a compact human-readable string.
   String _formatFileSize(int bytes) {
     if (bytes <= 0) return '';
     const suffixes = ['B', 'KB', 'MB', 'GB'];
