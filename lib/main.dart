@@ -21,6 +21,23 @@ const List<String> kSupportedAudioExtensions = [
   'mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac',
 ];
 
+/// Strips the file extension from a file name for cleaner display.
+/// E.g. "song.mp3" -> "song". If there's no extension, returns as-is.
+String stripExtension(String fileName) {
+  final lastDot = fileName.lastIndexOf('.');
+  if (lastDot <= 0) return fileName;
+  return fileName.substring(0, lastDot);
+}
+
+/// Formats a [Duration] as "m:ss". Returns "--:--" if [duration] is null.
+String formatDuration(Duration? duration) {
+  if (duration == null) return '--:--';
+  final totalSeconds = duration.inSeconds;
+  final minutes = totalSeconds ~/ 60;
+  final seconds = totalSeconds % 60;
+  return '$minutes:${seconds.toString().padLeft(2, '0')}';
+}
+
 /// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
   const NightcorePlayerApp({super.key});
@@ -248,6 +265,7 @@ class PlayerScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final hasTrack = currentTrackName != null;
+    final displayName = hasTrack ? stripExtension(currentTrackName!) : null;
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -284,9 +302,9 @@ class PlayerScreen extends StatelessWidget {
 
           const Spacer(flex: 1),
 
-          // Track title
+          // Track title (extension stripped for display).
           Text(
-            hasTrack ? currentTrackName! : 'No track loaded',
+            displayName ?? 'No track loaded',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(
@@ -332,7 +350,8 @@ class PlayerScreen extends StatelessWidget {
 
           const SizedBox(height: 24),
 
-          // Progress bar placeholder (disabled, static for now)
+          // Progress bar (still non-interactive — seeking arrives in Phase 7)
+          // but now shows real duration/position text underneath.
           Column(
             children: [
               SliderTheme(
@@ -345,13 +364,37 @@ class PlayerScreen extends StatelessWidget {
                   onChanged: null, // Disabled until Phase 7
                 ),
               ),
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 4.0),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4.0),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('0:00', style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
-                    Text('0:00', style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
+                    // Current position, updates live via positionStream.
+                    StreamBuilder<Duration>(
+                      stream: player.positionStream,
+                      builder: (context, snapshot) {
+                        return Text(
+                          formatDuration(snapshot.data),
+                          style: const TextStyle(
+                            color: AppColors.textSecondary,
+                            fontSize: 12,
+                          ),
+                        );
+                      },
+                    ),
+                    // Total duration, updates when metadata resolves.
+                    StreamBuilder<Duration?>(
+                      stream: player.durationStream,
+                      builder: (context, snapshot) {
+                        return Text(
+                          formatDuration(snapshot.data),
+                          style: const TextStyle(
+                            color: AppColors.textSecondary,
+                            fontSize: 12,
+                          ),
+                        );
+                      },
+                    ),
                   ],
                 ),
               ),
@@ -503,7 +546,7 @@ class QueueScreen extends StatelessWidget {
                                 ),
                         ),
                         title: Text(
-                          file.name,
+                          stripExtension(file.name),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
@@ -533,6 +576,7 @@ class QueueScreen extends StatelessWidget {
   }
 }
 
+/// Empty-state placeholder shown when the queue has no tracks yet.
 class _EmptyQueueState extends StatelessWidget {
   const _EmptyQueueState();
 
