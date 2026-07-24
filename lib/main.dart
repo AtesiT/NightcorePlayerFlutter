@@ -246,7 +246,7 @@ class _RootShellState extends State<RootShell> {
   }
 }
 
-class PlayerScreen extends StatelessWidget {
+class PlayerScreen extends StatefulWidget {
   final String? currentTrackName;
   final bool isLoading;
   final AudioPlayer player;
@@ -263,9 +263,52 @@ class PlayerScreen extends StatelessWidget {
   });
 
   @override
+  State<PlayerScreen> createState() => _PlayerScreenState();
+}
+
+class _PlayerScreenState extends State<PlayerScreen> {
+  // Local drag state for the seek slider. When _isDragging is true, the
+  // displayed position/slider value is driven by _dragPosition instead of
+  // the live positionStream, giving instant visual feedback while dragging.
+  bool _isDragging = false;
+  Duration? _dragPosition;
+  bool _wasPlayingBeforeDrag = false;
+
+  void _onSeekStart(double value) {
+    _wasPlayingBeforeDrag = widget.player.playing;
+    setState(() {
+      _isDragging = true;
+      _dragPosition = Duration(milliseconds: value.round());
+    });
+    if (_wasPlayingBeforeDrag) {
+      widget.player.pause();
+    }
+  }
+
+  void _onSeekChanged(double value) {
+    setState(() {
+      _dragPosition = Duration(milliseconds: value.round());
+    });
+  }
+
+  Future<void> _onSeekEnd(double value) async {
+    final seekTarget = Duration(milliseconds: value.round());
+    await widget.player.seek(seekTarget);
+    if (_wasPlayingBeforeDrag) {
+      await widget.player.play();
+    }
+    if (mounted) {
+      setState(() {
+        _isDragging = false;
+        _dragPosition = null;
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final hasTrack = currentTrackName != null;
-    final displayName = hasTrack ? stripExtension(currentTrackName!) : null;
+    final hasTrack = widget.currentTrackName != null;
+    final displayName = hasTrack ? stripExtension(widget.currentTrackName!) : null;
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -290,7 +333,7 @@ class PlayerScreen extends StatelessWidget {
               ],
             ),
             child: Center(
-              child: isLoading
+              child: widget.isLoading
                   ? const CircularProgressIndicator(color: AppColors.accentGreen)
                   : const Icon(
                       Icons.music_note_rounded,
@@ -318,7 +361,7 @@ class PlayerScreen extends StatelessWidget {
 
           // Live status text driven by the player state stream.
           StreamBuilder<PlayerState>(
-            stream: player.playerStateStream,
+            stream: widget.player.playerStateStream,
             builder: (context, snapshot) {
               final state = snapshot.data;
               final playing = state?.playing ?? false;
@@ -327,7 +370,7 @@ class PlayerScreen extends StatelessWidget {
               String statusText;
               if (!hasTrack) {
                 statusText = 'Pick a file to get started';
-              } else if (isLoading) {
+              } else if (widget.isLoading) {
                 statusText = 'Loading...';
               } else if (processingState == ProcessingState.completed) {
                 statusText = 'Finished';
@@ -350,55 +393,68 @@ class PlayerScreen extends StatelessWidget {
 
           const SizedBox(height: 24),
 
-          // Progress bar (still non-interactive — seeking arrives in Phase 7)
-          // but now shows real duration/position text underneath.
-          Column(
-            children: [
-              SliderTheme(
-                data: SliderTheme.of(context).copyWith(
-                  trackHeight: 3,
-                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                ),
-                child: Slider(
-                  value: 0,
-                  onChanged: null, // Disabled until Phase 7
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4.0),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    // Current position, updates live via positionStream.
-                    StreamBuilder<Duration>(
-                      stream: player.positionStream,
-                      builder: (context, snapshot) {
-                        return Text(
-                          formatDuration(snapshot.data),
-                          style: const TextStyle(
-                            color: AppColors.textSecondary,
-                            fontSize: 12,
-                          ),
-                        );
-                      },
-                    ),
-                    // Total duration, updates when metadata resolves.
-                    StreamBuilder<Duration?>(
-                      stream: player.durationStream,
-                      builder: (context, snapshot) {
-                        return Text(
-                          formatDuration(snapshot.data),
-                          style: const TextStyle(
-                            color: AppColors.textSecondary,
-                            fontSize: 12,
-                          ),
-                        );
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ],
+          // Seekable progress bar, driven by duration + position streams,
+          // overridden locally by drag state while the user is interacting.
+          StreamBuilder<Duration?>(
+            stream: widget.player.durationStream,
+            builder: (context, durationSnapshot) {
+              final duration = durationSnapshot.data;
+              final maxMs = (duration?.inMilliseconds ?? 0).toDouble();
+              final sliderEnabled = hasTrack && maxMs > 0;
+
+              return StreamBuilder<Duration>(
+                stream: widget.player.positionStream,
+                builder: (context, positionSnapshot) {
+                  final livePosition = positionSnapshot.data ?? Duration.zero;
+                  final displayPosition =
+                      _isDragging && _dragPosition != null ? _dragPosition! : livePosition;
+
+                  final clampedMs = displayPosition.inMilliseconds
+                      .clamp(0, maxMs > 0 ? maxMs.toInt() : 0)
+                      .toDouble();
+
+                  return Column(
+                    children: [
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 3,
+                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                        ),
+                        child: Slider(
+                          value: sliderEnabled ? clampedMs : 0.0,
+                          max: sliderEnabled ? maxMs : 1.0,
+                          onChanged: sliderEnabled ? _onSeekChanged : null,
+                          onChangeStart: sliderEnabled ? _onSeekStart : null,
+                          onChangeEnd: sliderEnabled ? _onSeekEnd : null,
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4.0),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              formatDuration(displayPosition),
+                              style: const TextStyle(
+                                color: AppColors.textSecondary,
+                                fontSize: 12,
+                              ),
+                            ),
+                            Text(
+                              formatDuration(duration),
+                              style: const TextStyle(
+                                color: AppColors.textSecondary,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
           ),
 
           const SizedBox(height: 12),
@@ -409,7 +465,7 @@ class PlayerScreen extends StatelessWidget {
             children: [
               // Stop — functional, resets position and pauses.
               IconButton(
-                onPressed: onStop,
+                onPressed: widget.onStop,
                 icon: const Icon(Icons.stop_rounded),
                 color: AppColors.textSecondary,
                 iconSize: 26,
@@ -420,11 +476,11 @@ class PlayerScreen extends StatelessWidget {
 
               // Play / Pause — functional, reacts to real player state.
               StreamBuilder<PlayerState>(
-                stream: player.playerStateStream,
+                stream: widget.player.playerStateStream,
                 builder: (context, snapshot) {
                   final playing = snapshot.data?.playing ?? false;
                   return GestureDetector(
-                    onTap: onPlayPause,
+                    onTap: widget.onPlayPause,
                     child: Container(
                       width: 64,
                       height: 64,
