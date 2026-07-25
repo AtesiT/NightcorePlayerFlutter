@@ -21,6 +21,12 @@ const List<String> kSupportedAudioExtensions = [
   'mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac',
 ];
 
+// Speed control bounds and step size.
+const double kMinSpeed = 0.5;
+const double kMaxSpeed = 2.0;
+const double kSpeedStep = 0.05;
+final int kSpeedDivisions = ((kMaxSpeed - kMinSpeed) / kSpeedStep).round(); // 30
+
 /// Strips the file extension from a file name for cleaner display.
 /// E.g. "song.mp3" -> "song". If there's no extension, returns as-is.
 String stripExtension(String fileName) {
@@ -37,6 +43,9 @@ String formatDuration(Duration? duration) {
   final seconds = totalSeconds % 60;
   return '$minutes:${seconds.toString().padLeft(2, '0')}';
 }
+
+/// Formats a speed multiplier as "1.25x".
+String formatSpeed(double speed) => '${speed.toStringAsFixed(2)}x';
 
 /// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
@@ -106,6 +115,10 @@ class _RootShellState extends State<RootShell> {
   // True while a track is in the process of being loaded into the engine.
   bool _isLoading = false;
 
+  // Current playback speed multiplier. Persists across track loads since
+  // it lives on the AudioPlayer instance itself, independent of the source.
+  double _speed = 1.0;
+
   @override
   void dispose() {
     _player.dispose();
@@ -165,6 +178,9 @@ class _RootShellState extends State<RootShell> {
 
     try {
       await _player.setFilePath(path);
+      // Re-apply the current speed setting to the newly loaded source,
+      // since some platform implementations reset it on load.
+      await _player.setSpeed(_speed);
     } catch (e) {
       _showError('Failed to load "${file.name}": $e');
     } finally {
@@ -196,6 +212,18 @@ class _RootShellState extends State<RootShell> {
     await _player.seek(Duration.zero);
   }
 
+  /// Updates the playback speed both in local state and on the engine.
+  Future<void> _setSpeed(double newSpeed) async {
+    setState(() {
+      _speed = newSpeed;
+    });
+    try {
+      await _player.setSpeed(newSpeed);
+    } catch (e) {
+      _showError('Failed to change speed: $e');
+    }
+  }
+
   void _showError(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -212,8 +240,10 @@ class _RootShellState extends State<RootShell> {
         currentTrackName: currentFile?.name,
         isLoading: _isLoading,
         player: _player,
+        speed: _speed,
         onPlayPause: _togglePlayPause,
         onStop: _stopPlayback,
+        onSpeedChanged: _setSpeed,
       ),
       QueueScreen(
         queue: _queue,
@@ -250,16 +280,20 @@ class PlayerScreen extends StatefulWidget {
   final String? currentTrackName;
   final bool isLoading;
   final AudioPlayer player;
+  final double speed;
   final VoidCallback onPlayPause;
   final VoidCallback onStop;
+  final ValueChanged<double> onSpeedChanged;
 
   const PlayerScreen({
     super.key,
     this.currentTrackName,
     this.isLoading = false,
     required this.player,
+    required this.speed,
     required this.onPlayPause,
     required this.onStop,
+    required this.onSpeedChanged,
   });
 
   @override
@@ -457,7 +491,45 @@ class _PlayerScreenState extends State<PlayerScreen> {
             },
           ),
 
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
+
+          // Speed (tempo) control — adjusts playback rate in real time.
+          Column(
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    'Speed',
+                    style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+                  ),
+                  Text(
+                    formatSpeed(widget.speed),
+                    style: const TextStyle(
+                      color: AppColors.accentGreen,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+              SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 3,
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                ),
+                child: Slider(
+                  value: widget.speed,
+                  min: kMinSpeed,
+                  max: kMaxSpeed,
+                  divisions: kSpeedDivisions,
+                  onChanged: widget.onSpeedChanged,
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 4),
 
           // Playback controls row.
           Row(
