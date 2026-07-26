@@ -21,11 +21,19 @@ const List<String> kSupportedAudioExtensions = [
   'mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac',
 ];
 
-// Speed control bounds and step size.
+// Speed & pitch control bounds and step size.
 const double kMinSpeed = 0.5;
 const double kMaxSpeed = 2.0;
 const double kSpeedStep = 0.05;
 final int kSpeedDivisions = ((kMaxSpeed - kMinSpeed) / kSpeedStep).round(); // 30
+
+// The standard Nightcore preset multiplier applied to both speed and pitch.
+const double kNightcoreSpeed = 1.25;
+
+// Tolerance used when comparing floating-point speed values, to safely
+// detect "is the slider at exactly the Nightcore preset" despite potential
+// tiny floating-point drift from division-based slider steps.
+const double kSpeedCompareTolerance = 0.001;
 
 /// Strips the file extension from a file name for cleaner display.
 /// E.g. "song.mp3" -> "song". If there's no extension, returns as-is.
@@ -102,22 +110,20 @@ class RootShell extends StatefulWidget {
 class _RootShellState extends State<RootShell> {
   int _selectedIndex = 0;
 
-  // Holds all picked audio files. PlatformFile already gives us name, path,
-  // and size without needing a custom model class — keeps things minimal.
   final List<PlatformFile> _queue = [];
-
-  // The just_audio engine instance.
   final AudioPlayer _player = AudioPlayer();
-
-  // Index of the currently loaded track within _queue, or null if none.
   int? _currentIndex;
-
-  // True while a track is in the process of being loaded into the engine.
   bool _isLoading = false;
 
-  // Current playback speed multiplier. Persists across track loads since
-  // it lives on the AudioPlayer instance itself, independent of the source.
+  // Combined speed & pitch multiplier. Both are always kept equal to
+  // reproduce the natural "tape/vinyl" Nightcore effect, where speeding up
+  // playback naturally raises pitch (and vice versa).
   double _speed = 1.0;
+
+  /// True when the current speed/pitch value matches the Nightcore preset
+  /// (within a small tolerance to account for floating-point drift).
+  bool get _isNightcoreActive =>
+      (_speed - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
 
   @override
   void dispose() {
@@ -131,9 +137,6 @@ class _RootShellState extends State<RootShell> {
     });
   }
 
-  /// Opens the native file picker allowing multi-selection of audio files,
-  /// appends the results to the queue, and auto-loads the first file if
-  /// the queue was previously empty.
   Future<void> _pickAudioFiles() async {
     try {
       final wasQueueEmpty = _queue.isEmpty;
@@ -144,7 +147,6 @@ class _RootShellState extends State<RootShell> {
         allowMultiple: true,
       );
 
-      // result is null if the user cancelled the picker.
       if (result == null || result.files.isEmpty) return;
 
       setState(() {
@@ -159,7 +161,6 @@ class _RootShellState extends State<RootShell> {
     }
   }
 
-  /// Loads the track at [index] into the audio engine.
   Future<void> _loadTrack(int index) async {
     if (index < 0 || index >= _queue.length) return;
 
@@ -178,9 +179,10 @@ class _RootShellState extends State<RootShell> {
 
     try {
       await _player.setFilePath(path);
-      // Re-apply the current speed setting to the newly loaded source,
-      // since some platform implementations reset it on load.
+      // Re-apply the current speed & pitch settings to the newly loaded
+      // source, since some platform implementations reset them on load.
       await _player.setSpeed(_speed);
+      await _player.setPitch(_speed);
     } catch (e) {
       _showError('Failed to load "${file.name}": $e');
     } finally {
@@ -192,10 +194,8 @@ class _RootShellState extends State<RootShell> {
     }
   }
 
-  /// Toggles between play and pause. Does nothing if no track is loaded.
   Future<void> _togglePlayPause() async {
     if (_currentIndex == null) return;
-
     if (_player.playing) {
       await _player.pause();
     } else {
@@ -203,24 +203,35 @@ class _RootShellState extends State<RootShell> {
     }
   }
 
-  /// Stops playback: pauses and resets position to the start.
-  /// Does not unload the track. Does nothing if no track is loaded.
   Future<void> _stopPlayback() async {
     if (_currentIndex == null) return;
-
     await _player.pause();
     await _player.seek(Duration.zero);
   }
 
-  /// Updates the playback speed both in local state and on the engine.
+  /// Updates the combined speed & pitch multiplier both in local state and
+  /// on the engine. Both are set to the same value to emulate natural
+  /// tape-speed pitch shifting (the classic Nightcore effect).
   Future<void> _setSpeed(double newSpeed) async {
     setState(() {
       _speed = newSpeed;
     });
     try {
       await _player.setSpeed(newSpeed);
+      await _player.setPitch(newSpeed);
     } catch (e) {
-      _showError('Failed to change speed: $e');
+      _showError('Failed to change speed/pitch: $e');
+    }
+  }
+
+  /// Toggles between the Nightcore preset (1.25x) and normal speed (1.0x).
+  /// This is a simple binary switch based on the current value — it does
+  /// NOT remember arbitrary manual slider positions between toggles.
+  void _toggleNightcoreMode() {
+    if (_isNightcoreActive) {
+      _setSpeed(1.0);
+    } else {
+      _setSpeed(kNightcoreSpeed);
     }
   }
 
@@ -241,9 +252,11 @@ class _RootShellState extends State<RootShell> {
         isLoading: _isLoading,
         player: _player,
         speed: _speed,
+        isNightcoreActive: _isNightcoreActive,
         onPlayPause: _togglePlayPause,
         onStop: _stopPlayback,
         onSpeedChanged: _setSpeed,
+        onToggleNightcore: _toggleNightcoreMode,
       ),
       QueueScreen(
         queue: _queue,
@@ -281,9 +294,11 @@ class PlayerScreen extends StatefulWidget {
   final bool isLoading;
   final AudioPlayer player;
   final double speed;
+  final bool isNightcoreActive;
   final VoidCallback onPlayPause;
   final VoidCallback onStop;
   final ValueChanged<double> onSpeedChanged;
+  final VoidCallback onToggleNightcore;
 
   const PlayerScreen({
     super.key,
@@ -291,9 +306,11 @@ class PlayerScreen extends StatefulWidget {
     this.isLoading = false,
     required this.player,
     required this.speed,
+    required this.isNightcoreActive,
     required this.onPlayPause,
     required this.onStop,
     required this.onSpeedChanged,
+    required this.onToggleNightcore,
   });
 
   @override
@@ -301,9 +318,6 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // Local drag state for the seek slider. When _isDragging is true, the
-  // displayed position/slider value is driven by _dragPosition instead of
-  // the live positionStream, giving instant visual feedback while dragging.
   bool _isDragging = false;
   Duration? _dragPosition;
   bool _wasPlayingBeforeDrag = false;
@@ -427,8 +441,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 24),
 
-          // Seekable progress bar, driven by duration + position streams,
-          // overridden locally by drag state while the user is interacting.
+          // Seekable progress bar.
           StreamBuilder<Duration?>(
             stream: widget.player.durationStream,
             builder: (context, durationSnapshot) {
@@ -493,15 +506,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 8),
 
-          // Speed (tempo) control — adjusts playback rate in real time.
+          // Speed & Pitch control — linked slider that adjusts both playback
+          // rate and pitch together, producing the classic Nightcore-style
+          // tape-speed effect (speeding up raises pitch, and vice versa).
           Column(
             children: [
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Text(
-                    'Speed',
-                    style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 200),
+                    child: Text(
+                      widget.isNightcoreActive ? '⚡ Nightcore Mode' : 'Speed & Pitch',
+                      key: ValueKey(widget.isNightcoreActive),
+                      style: TextStyle(
+                        color: widget.isNightcoreActive
+                            ? AppColors.accentGreen
+                            : AppColors.textSecondary,
+                        fontSize: 13,
+                        fontWeight:
+                            widget.isNightcoreActive ? FontWeight.w700 : FontWeight.normal,
+                      ),
+                    ),
                   ),
                   Text(
                     formatSpeed(widget.speed),
@@ -526,6 +552,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   onChanged: widget.onSpeedChanged,
                 ),
               ),
+              const SizedBox(height: 4),
+              _NightcoreToggleChip(
+                isActive: widget.isNightcoreActive,
+                onTap: widget.onToggleNightcore,
+              ),
             ],
           ),
 
@@ -535,18 +566,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              // Stop — functional, resets position and pauses.
               IconButton(
                 onPressed: widget.onStop,
                 icon: const Icon(Icons.stop_rounded),
                 color: AppColors.textSecondary,
                 iconSize: 26,
               ),
-
-              // Skip previous — decorative until Phase 14.
               const Icon(Icons.skip_previous_rounded, color: AppColors.surfaceLight, size: 36),
-
-              // Play / Pause — functional, reacts to real player state.
               StreamBuilder<PlayerState>(
                 stream: widget.player.playerStateStream,
                 builder: (context, snapshot) {
@@ -569,17 +595,60 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   );
                 },
               ),
-
-              // Skip next — decorative until Phase 14.
               const Icon(Icons.skip_next_rounded, color: AppColors.surfaceLight, size: 36),
-
-              // Repeat — decorative placeholder, not part of current roadmap scope.
               const Icon(Icons.repeat, color: AppColors.surfaceLight, size: 24),
             ],
           ),
 
           const Spacer(flex: 2),
         ],
+      ),
+    );
+  }
+}
+
+/// A pill-shaped toggle chip for quickly enabling/disabling Nightcore Mode.
+/// Filled green when active, outlined when inactive.
+class _NightcoreToggleChip extends StatelessWidget {
+  final bool isActive;
+  final VoidCallback onTap;
+
+  const _NightcoreToggleChip({
+    required this.isActive,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+        decoration: BoxDecoration(
+          color: isActive ? AppColors.accentGreen : Colors.transparent,
+          border: Border.all(color: AppColors.accentGreen, width: 1.5),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.bolt_rounded,
+              size: 18,
+              color: isActive ? Colors.black : AppColors.accentGreen,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              'Nightcore',
+              style: TextStyle(
+                color: isActive ? Colors.black : AppColors.accentGreen,
+                fontWeight: FontWeight.w600,
+                fontSize: 13,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -601,7 +670,6 @@ class QueueScreen extends StatelessWidget {
     required this.onTrackTapped,
   });
 
-  /// Formats file size in bytes into a compact human-readable string.
   String _formatFileSize(int bytes) {
     if (bytes <= 0) return '';
     const suffixes = ['B', 'KB', 'MB', 'GB'];
