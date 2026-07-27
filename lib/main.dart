@@ -30,13 +30,10 @@ final int kSpeedDivisions = ((kMaxSpeed - kMinSpeed) / kSpeedStep).round(); // 3
 // The standard Nightcore preset multiplier applied to both speed and pitch.
 const double kNightcoreSpeed = 1.25;
 
-// Tolerance used when comparing floating-point speed values, to safely
-// detect "is the slider at exactly the Nightcore preset" despite potential
-// tiny floating-point drift from division-based slider steps.
+// Tolerance used when comparing floating-point speed values.
 const double kSpeedCompareTolerance = 0.001;
 
 /// Strips the file extension from a file name for cleaner display.
-/// E.g. "song.mp3" -> "song". If there's no extension, returns as-is.
 String stripExtension(String fileName) {
   final lastDot = fileName.lastIndexOf('.');
   if (lastDot <= 0) return fileName;
@@ -54,6 +51,9 @@ String formatDuration(Duration? duration) {
 
 /// Formats a speed multiplier as "1.25x".
 String formatSpeed(double speed) => '${speed.toStringAsFixed(2)}x';
+
+/// Formats a 0.0–1.0 volume level as a percentage string, e.g. "100%".
+String formatVolumePercent(double volume) => '${(volume * 100).round()}%';
 
 /// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
@@ -115,13 +115,18 @@ class _RootShellState extends State<RootShell> {
   int? _currentIndex;
   bool _isLoading = false;
 
-  // Combined speed & pitch multiplier. Both are always kept equal to
-  // reproduce the natural "tape/vinyl" Nightcore effect, where speeding up
-  // playback naturally raises pitch (and vice versa).
+  // Combined speed & pitch multiplier.
   double _speed = 1.0;
 
-  /// True when the current speed/pitch value matches the Nightcore preset
-  /// (within a small tolerance to account for floating-point drift).
+  // Current volume level (0.0–1.0). Lives on the engine instance, so it
+  // naturally persists across track loads without needing to be re-applied
+  // (unlike speed/pitch, which some platforms reset on setFilePath).
+  double _volume = 1.0;
+
+  // Stores the volume level right before muting, so tapping the speaker
+  // icon again can restore it. Defaults to 1.0 as a safe fallback.
+  double _volumeBeforeMute = 1.0;
+
   bool get _isNightcoreActive =>
       (_speed - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
 
@@ -179,8 +184,11 @@ class _RootShellState extends State<RootShell> {
 
     try {
       await _player.setFilePath(path);
-      // Re-apply the current speed & pitch settings to the newly loaded
-      // source, since some platform implementations reset them on load.
+      // Re-apply speed & pitch, since some platforms reset them on load.
+      // Volume is intentionally NOT re-applied here — just_audio keeps the
+      // engine-level volume across sources automatically, matching how
+      // apps like Spotify treat volume as an app-wide/system-wide setting
+      // rather than a per-track one.
       await _player.setSpeed(_speed);
       await _player.setPitch(_speed);
     } catch (e) {
@@ -209,9 +217,6 @@ class _RootShellState extends State<RootShell> {
     await _player.seek(Duration.zero);
   }
 
-  /// Updates the combined speed & pitch multiplier both in local state and
-  /// on the engine. Both are set to the same value to emulate natural
-  /// tape-speed pitch shifting (the classic Nightcore effect).
   Future<void> _setSpeed(double newSpeed) async {
     setState(() {
       _speed = newSpeed;
@@ -224,14 +229,36 @@ class _RootShellState extends State<RootShell> {
     }
   }
 
-  /// Toggles between the Nightcore preset (1.25x) and normal speed (1.0x).
-  /// This is a simple binary switch based on the current value — it does
-  /// NOT remember arbitrary manual slider positions between toggles.
   void _toggleNightcoreMode() {
     if (_isNightcoreActive) {
       _setSpeed(1.0);
     } else {
       _setSpeed(kNightcoreSpeed);
+    }
+  }
+
+  /// Updates the volume both in local state and on the engine.
+  Future<void> _setVolume(double newVolume) async {
+    setState(() {
+      _volume = newVolume;
+    });
+    try {
+      await _player.setVolume(newVolume);
+    } catch (e) {
+      _showError('Failed to change volume: $e');
+    }
+  }
+
+  /// Toggles mute: if currently audible, remembers the volume and sets it
+  /// to 0. If currently muted, restores the remembered volume.
+  void _toggleMute() {
+    if (_volume > 0) {
+      _volumeBeforeMute = _volume;
+      _setVolume(0.0);
+    } else {
+      // Fallback to full volume if, for some edge case, the remembered
+      // value was also 0.
+      _setVolume(_volumeBeforeMute > 0 ? _volumeBeforeMute : 1.0);
     }
   }
 
@@ -253,10 +280,13 @@ class _RootShellState extends State<RootShell> {
         player: _player,
         speed: _speed,
         isNightcoreActive: _isNightcoreActive,
+        volume: _volume,
         onPlayPause: _togglePlayPause,
         onStop: _stopPlayback,
         onSpeedChanged: _setSpeed,
         onToggleNightcore: _toggleNightcoreMode,
+        onVolumeChanged: _setVolume,
+        onToggleMute: _toggleMute,
       ),
       QueueScreen(
         queue: _queue,
@@ -295,10 +325,13 @@ class PlayerScreen extends StatefulWidget {
   final AudioPlayer player;
   final double speed;
   final bool isNightcoreActive;
+  final double volume;
   final VoidCallback onPlayPause;
   final VoidCallback onStop;
   final ValueChanged<double> onSpeedChanged;
   final VoidCallback onToggleNightcore;
+  final ValueChanged<double> onVolumeChanged;
+  final VoidCallback onToggleMute;
 
   const PlayerScreen({
     super.key,
@@ -307,10 +340,13 @@ class PlayerScreen extends StatefulWidget {
     required this.player,
     required this.speed,
     required this.isNightcoreActive,
+    required this.volume,
     required this.onPlayPause,
     required this.onStop,
     required this.onSpeedChanged,
     required this.onToggleNightcore,
+    required this.onVolumeChanged,
+    required this.onToggleMute,
   });
 
   @override
@@ -353,6 +389,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  /// Returns the appropriate speaker icon for the current volume level.
+  IconData _volumeIcon(double volume) {
+    if (volume <= 0.0) return Icons.volume_off_rounded;
+    if (volume < 0.5) return Icons.volume_down_rounded;
+    return Icons.volume_up_rounded;
+  }
+
   @override
   Widget build(BuildContext context) {
     final hasTrack = widget.currentTrackName != null;
@@ -367,8 +410,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           // Album art placeholder
           Container(
-            width: 260,
-            height: 260,
+            width: 220,
+            height: 220,
             decoration: BoxDecoration(
               color: AppColors.surface,
               borderRadius: BorderRadius.circular(16),
@@ -385,7 +428,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   ? const CircularProgressIndicator(color: AppColors.accentGreen)
                   : const Icon(
                       Icons.music_note_rounded,
-                      size: 100,
+                      size: 90,
                       color: AppColors.textSecondary,
                     ),
             ),
@@ -439,7 +482,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             },
           ),
 
-          const SizedBox(height: 24),
+          const SizedBox(height: 16),
 
           // Seekable progress bar.
           StreamBuilder<Duration?>(
@@ -504,11 +547,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
             },
           ),
 
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
 
-          // Speed & Pitch control — linked slider that adjusts both playback
-          // rate and pitch together, producing the classic Nightcore-style
-          // tape-speed effect (speeding up raises pitch, and vice versa).
+          // Speed & Pitch control.
           Column(
             children: [
               Row(
@@ -560,7 +601,50 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ],
           ),
 
-          const SizedBox(height: 4),
+          const SizedBox(height: 10),
+
+          // Volume control — speaker icon (tap to mute/unmute) + slider.
+          Row(
+            children: [
+              GestureDetector(
+                onTap: widget.onToggleMute,
+                child: Icon(
+                  _volumeIcon(widget.volume),
+                  color: AppColors.textSecondary,
+                  size: 22,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 3,
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+                  ),
+                  child: Slider(
+                    value: widget.volume,
+                    min: 0.0,
+                    max: 1.0,
+                    onChanged: widget.onVolumeChanged,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 38,
+                child: Text(
+                  formatVolumePercent(widget.volume),
+                  textAlign: TextAlign.right,
+                  style: const TextStyle(
+                    color: AppColors.textSecondary,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 8),
 
           // Playback controls row.
           Row(
@@ -580,8 +664,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   return GestureDetector(
                     onTap: widget.onPlayPause,
                     child: Container(
-                      width: 64,
-                      height: 64,
+                      width: 60,
+                      height: 60,
                       decoration: const BoxDecoration(
                         color: AppColors.accentGreen,
                         shape: BoxShape.circle,
@@ -589,7 +673,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       child: Icon(
                         playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
                         color: Colors.black,
-                        size: 36,
+                        size: 34,
                       ),
                     ),
                   );
@@ -608,7 +692,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 }
 
 /// A pill-shaped toggle chip for quickly enabling/disabling Nightcore Mode.
-/// Filled green when active, outlined when inactive.
 class _NightcoreToggleChip extends StatelessWidget {
   final bool isActive;
   final VoidCallback onTap;
