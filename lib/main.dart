@@ -1,5 +1,9 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 
 void main() {
@@ -12,6 +16,7 @@ class AppColors {
   static const surface = Color(0xFF282828);
   static const surfaceLight = Color(0xFF3E3E3E);
   static const accentGreen = Color(0xFF1DB954);
+  static const accentRed = Color(0xFFE57373);
   static const textPrimary = Colors.white;
   static const textSecondary = Color(0xFFB3B3B3);
 }
@@ -32,6 +37,9 @@ const double kNightcoreSpeed = 1.25;
 
 // Tolerance used when comparing floating-point speed values.
 const double kSpeedCompareTolerance = 0.001;
+
+// Maximum time to wait for a track to load before treating it as failed.
+const int kLoadTimeoutSeconds = 15;
 
 /// Strips the file extension from a file name for cleaner display.
 String stripExtension(String fileName) {
@@ -54,6 +62,40 @@ String formatSpeed(double speed) => '${speed.toStringAsFixed(2)}x';
 
 /// Formats a 0.0–1.0 volume level as a percentage string, e.g. "100%".
 String formatVolumePercent(double volume) => '${(volume * 100).round()}%';
+
+/// Translates a raised exception into a short, user-friendly message.
+/// Covers the most common failure modes: missing files, unsupported/corrupt
+/// formats, timeouts, and generic platform errors.
+String describeError(Object error) {
+  if (error is TimeoutException) {
+    return 'Loading timed out. The file may be corrupted, too large, or inaccessible.';
+  }
+
+  if (error is PlayerException) {
+    final msg = (error.message ?? '').toLowerCase();
+    if (msg.contains('source error') ||
+        msg.contains('unsupported') ||
+        msg.contains('decoder')) {
+      return 'Unsupported or corrupted audio format.';
+    }
+    if (msg.contains('no such file') ||
+        msg.contains('enoent') ||
+        msg.contains('not found')) {
+      return 'File not found. It may have been moved or deleted.';
+    }
+    return 'Playback error (code ${error.code}): ${error.message ?? 'Unknown error'}';
+  }
+
+  if (error is PlatformException) {
+    return 'Platform error: ${error.message ?? error.code}';
+  }
+
+  if (error is FileSystemException) {
+    return 'File not found. It may have been moved or deleted.';
+  }
+
+  return 'Unexpected error: $error';
+}
 
 /// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
@@ -115,16 +157,12 @@ class _RootShellState extends State<RootShell> {
   int? _currentIndex;
   bool _isLoading = false;
 
-  // Combined speed & pitch multiplier.
+  // Indices of queue items that failed to load. Cleared for an index as
+  // soon as the user retries and that retry succeeds.
+  final Set<int> _loadErrorIndices = {};
+
   double _speed = 1.0;
-
-  // Current volume level (0.0–1.0). Lives on the engine instance, so it
-  // naturally persists across track loads without needing to be re-applied
-  // (unlike speed/pitch, which some platforms reset on setFilePath).
   double _volume = 1.0;
-
-  // Stores the volume level right before muting, so tapping the speaker
-  // icon again can restore it. Defaults to 1.0 as a safe fallback.
   double _volumeBeforeMute = 1.0;
 
   bool get _isNightcoreActive =>
@@ -142,6 +180,9 @@ class _RootShellState extends State<RootShell> {
     });
   }
 
+  /// Opens the native file picker allowing multi-selection of audio files,
+  /// appends the results to the queue, and auto-loads the first file if
+  /// the queue was previously empty.
   Future<void> _pickAudioFiles() async {
     try {
       final wasQueueEmpty = _queue.isEmpty;
@@ -162,37 +203,56 @@ class _RootShellState extends State<RootShell> {
         await _loadTrack(0);
       }
     } catch (e) {
-      _showError('Failed to pick files: $e');
+      _showError('Failed to open file picker: ${describeError(e)}');
     }
   }
 
+  /// Loads the track at [index] into the audio engine. On failure, the
+  /// selection rolls back to whatever was previously loaded (or null),
+  /// the failed index is flagged in the queue UI, and the track remains
+  /// in the queue for the user to retry or ignore.
   Future<void> _loadTrack(int index) async {
     if (index < 0 || index >= _queue.length) return;
 
     final file = _queue[index];
     final path = file.path;
+    final previousIndex = _currentIndex;
 
     if (path == null) {
-      _showError('Could not resolve a file path for "${file.name}".');
+      _handleLoadFailure(
+        index: index,
+        previousIndex: previousIndex,
+        fileName: file.name,
+        message: 'Could not resolve a valid file path.',
+      );
       return;
     }
 
     setState(() {
       _isLoading = true;
       _currentIndex = index;
+      _loadErrorIndices.remove(index);
     });
 
     try {
-      await _player.setFilePath(path);
+      await _player.setFilePath(path).timeout(
+        const Duration(seconds: kLoadTimeoutSeconds),
+        onTimeout: () {
+          throw TimeoutException(
+            'Loading timed out after ${kLoadTimeoutSeconds}s',
+          );
+        },
+      );
       // Re-apply speed & pitch, since some platforms reset them on load.
-      // Volume is intentionally NOT re-applied here — just_audio keeps the
-      // engine-level volume across sources automatically, matching how
-      // apps like Spotify treat volume as an app-wide/system-wide setting
-      // rather than a per-track one.
       await _player.setSpeed(_speed);
       await _player.setPitch(_speed);
     } catch (e) {
-      _showError('Failed to load "${file.name}": $e');
+      _handleLoadFailure(
+        index: index,
+        previousIndex: previousIndex,
+        fileName: file.name,
+        message: describeError(e),
+      );
     } finally {
       if (mounted) {
         setState(() {
@@ -202,19 +262,44 @@ class _RootShellState extends State<RootShell> {
     }
   }
 
+  /// Marks [index] as failed, reverts the active selection to whatever was
+  /// loaded before the attempt, and surfaces a descriptive error message.
+  void _handleLoadFailure({
+    required int index,
+    required int? previousIndex,
+    required String fileName,
+    required String message,
+  }) {
+    if (!mounted) return;
+    setState(() {
+      _loadErrorIndices.add(index);
+      _currentIndex = previousIndex;
+      _isLoading = false;
+    });
+    _showError('Couldn\'t load "${stripExtension(fileName)}": $message');
+  }
+
   Future<void> _togglePlayPause() async {
     if (_currentIndex == null) return;
-    if (_player.playing) {
-      await _player.pause();
-    } else {
-      await _player.play();
+    try {
+      if (_player.playing) {
+        await _player.pause();
+      } else {
+        await _player.play();
+      }
+    } catch (e) {
+      _showError('Playback error: ${describeError(e)}');
     }
   }
 
   Future<void> _stopPlayback() async {
     if (_currentIndex == null) return;
-    await _player.pause();
-    await _player.seek(Duration.zero);
+    try {
+      await _player.pause();
+      await _player.seek(Duration.zero);
+    } catch (e) {
+      _showError('Playback error: ${describeError(e)}');
+    }
   }
 
   Future<void> _setSpeed(double newSpeed) async {
@@ -225,7 +310,7 @@ class _RootShellState extends State<RootShell> {
       await _player.setSpeed(newSpeed);
       await _player.setPitch(newSpeed);
     } catch (e) {
-      _showError('Failed to change speed/pitch: $e');
+      _showError('Failed to change speed/pitch: ${describeError(e)}');
     }
   }
 
@@ -237,7 +322,6 @@ class _RootShellState extends State<RootShell> {
     }
   }
 
-  /// Updates the volume both in local state and on the engine.
   Future<void> _setVolume(double newVolume) async {
     setState(() {
       _volume = newVolume;
@@ -245,19 +329,15 @@ class _RootShellState extends State<RootShell> {
     try {
       await _player.setVolume(newVolume);
     } catch (e) {
-      _showError('Failed to change volume: $e');
+      _showError('Failed to change volume: ${describeError(e)}');
     }
   }
 
-  /// Toggles mute: if currently audible, remembers the volume and sets it
-  /// to 0. If currently muted, restores the remembered volume.
   void _toggleMute() {
     if (_volume > 0) {
       _volumeBeforeMute = _volume;
       _setVolume(0.0);
     } else {
-      // Fallback to full volume if, for some edge case, the remembered
-      // value was also 0.
       _setVolume(_volumeBeforeMute > 0 ? _volumeBeforeMute : 1.0);
     }
   }
@@ -265,7 +345,7 @@ class _RootShellState extends State<RootShell> {
   void _showError(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
+      SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
     );
   }
 
@@ -292,6 +372,7 @@ class _RootShellState extends State<RootShell> {
         queue: _queue,
         currentIndex: _currentIndex,
         isLoading: _isLoading,
+        errorIndices: _loadErrorIndices,
         onAddPressed: _pickAudioFiles,
         onTrackTapped: _loadTrack,
       ),
@@ -377,9 +458,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   Future<void> _onSeekEnd(double value) async {
     final seekTarget = Duration(milliseconds: value.round());
-    await widget.player.seek(seekTarget);
-    if (_wasPlayingBeforeDrag) {
-      await widget.player.play();
+    try {
+      await widget.player.seek(seekTarget);
+      if (_wasPlayingBeforeDrag) {
+        await widget.player.play();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Seek failed: ${describeError(e)}')),
+        );
+      }
     }
     if (mounted) {
       setState(() {
@@ -389,7 +478,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  /// Returns the appropriate speaker icon for the current volume level.
   IconData _volumeIcon(double volume) {
     if (volume <= 0.0) return Icons.volume_off_rounded;
     if (volume < 0.5) return Icons.volume_down_rounded;
@@ -408,7 +496,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
         children: [
           const Spacer(flex: 2),
 
-          // Album art placeholder
           Container(
             width: 220,
             height: 220,
@@ -436,7 +523,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const Spacer(flex: 1),
 
-          // Track title (extension stripped for display).
           Text(
             displayName ?? 'No track loaded',
             maxLines: 1,
@@ -450,7 +536,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
           const SizedBox(height: 6),
 
-          // Live status text driven by the player state stream.
           StreamBuilder<PlayerState>(
             stream: widget.player.playerStateStream,
             builder: (context, snapshot) {
@@ -484,7 +569,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 16),
 
-          // Seekable progress bar.
           StreamBuilder<Duration?>(
             stream: widget.player.durationStream,
             builder: (context, durationSnapshot) {
@@ -549,7 +633,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 6),
 
-          // Speed & Pitch control.
           Column(
             children: [
               Row(
@@ -603,7 +686,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 10),
 
-          // Volume control — speaker icon (tap to mute/unmute) + slider.
           Row(
             children: [
               GestureDetector(
@@ -646,7 +728,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 8),
 
-          // Playback controls row.
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
@@ -741,6 +822,7 @@ class QueueScreen extends StatelessWidget {
   final List<PlatformFile> queue;
   final int? currentIndex;
   final bool isLoading;
+  final Set<int> errorIndices;
   final VoidCallback onAddPressed;
   final ValueChanged<int> onTrackTapped;
 
@@ -749,6 +831,7 @@ class QueueScreen extends StatelessWidget {
     required this.queue,
     required this.currentIndex,
     required this.isLoading,
+    required this.errorIndices,
     required this.onAddPressed,
     required this.onTrackTapped,
   });
@@ -798,17 +881,22 @@ class QueueScreen extends StatelessWidget {
                       final file = queue[index];
                       final isActive = index == currentIndex;
                       final isActiveLoading = isActive && isLoading;
+                      final hasError = errorIndices.contains(index);
 
                       return ListTile(
                         onTap: () => onTrackTapped(index),
-                        selected: isActive,
+                        selected: isActive && !hasError,
                         selectedTileColor: AppColors.surface,
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(8),
+                          side: hasError
+                              ? const BorderSide(color: AppColors.accentRed, width: 1)
+                              : BorderSide.none,
                         ),
                         leading: CircleAvatar(
-                          backgroundColor:
-                              isActive ? AppColors.accentGreen : AppColors.surface,
+                          backgroundColor: hasError
+                              ? AppColors.accentRed.withValues(alpha: 0.15)
+                              : (isActive ? AppColors.accentGreen : AppColors.surface),
                           child: isActiveLoading
                               ? const SizedBox(
                                   width: 16,
@@ -819,8 +907,12 @@ class QueueScreen extends StatelessWidget {
                                   ),
                                 )
                               : Icon(
-                                  isActive ? Icons.graphic_eq : Icons.music_note,
-                                  color: isActive ? Colors.black : AppColors.textSecondary,
+                                  hasError
+                                      ? Icons.error_outline
+                                      : (isActive ? Icons.graphic_eq : Icons.music_note),
+                                  color: hasError
+                                      ? AppColors.accentRed
+                                      : (isActive ? Colors.black : AppColors.textSecondary),
                                   size: 20,
                                 ),
                         ),
@@ -829,14 +921,21 @@ class QueueScreen extends StatelessWidget {
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
-                            color: isActive ? AppColors.accentGreen : AppColors.textPrimary,
+                            color: hasError
+                                ? AppColors.accentRed
+                                : (isActive ? AppColors.accentGreen : AppColors.textPrimary),
                             fontSize: 14,
                             fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
                           ),
                         ),
                         subtitle: Text(
-                          _formatFileSize(file.size),
-                          style: const TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                          hasError
+                              ? 'Failed to load — tap to retry'
+                              : _formatFileSize(file.size),
+                          style: TextStyle(
+                            color: hasError ? AppColors.accentRed : AppColors.textSecondary,
+                            fontSize: 12,
+                          ),
                         ),
                       );
                     },
