@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -41,6 +42,21 @@ const double kSpeedCompareTolerance = 0.001;
 // Maximum time to wait for a track to load before treating it as failed.
 const int kLoadTimeoutSeconds = 15;
 
+/// A single entry in the playback queue. Wraps a [PlatformFile] with a
+/// stable [id] (so it can be tracked across reordering/removal) and a
+/// mutable error flag for load-failure feedback.
+class QueueItem {
+  final int id;
+  final PlatformFile file;
+  bool hasError;
+
+  QueueItem({
+    required this.id,
+    required this.file,
+    this.hasError = false,
+  });
+}
+
 /// Strips the file extension from a file name for cleaner display.
 String stripExtension(String fileName) {
   final lastDot = fileName.lastIndexOf('.');
@@ -64,8 +80,6 @@ String formatSpeed(double speed) => '${speed.toStringAsFixed(2)}x';
 String formatVolumePercent(double volume) => '${(volume * 100).round()}%';
 
 /// Translates a raised exception into a short, user-friendly message.
-/// Covers the most common failure modes: missing files, unsupported/corrupt
-/// formats, timeouts, and generic platform errors.
 String describeError(Object error) {
   if (error is TimeoutException) {
     return 'Loading timed out. The file may be corrupted, too large, or inaccessible.';
@@ -139,9 +153,9 @@ class NightcorePlayerApp extends StatelessWidget {
 }
 
 /// The root shell hosting the bottom navigation bar and switching between
-/// the Player tab and the Queue tab. Also owns the picked-files queue state
-/// and the audio player instance for now, since it's the shared ancestor
-/// of both tabs. Will be extracted into a dedicated controller in Phase 15.
+/// the Player tab and the Queue tab. Also owns the queue state and the
+/// audio player instance for now, since it's the shared ancestor of both
+/// tabs. Will be extracted into a dedicated controller in Phase 15.
 class RootShell extends StatefulWidget {
   const RootShell({super.key});
 
@@ -152,14 +166,19 @@ class RootShell extends StatefulWidget {
 class _RootShellState extends State<RootShell> {
   int _selectedIndex = 0;
 
-  final List<PlatformFile> _queue = [];
+  final List<QueueItem> _queue = [];
   final AudioPlayer _player = AudioPlayer();
-  int? _currentIndex;
-  bool _isLoading = false;
 
-  // Indices of queue items that failed to load. Cleared for an index as
-  // soon as the user retries and that retry succeeds.
-  final Set<int> _loadErrorIndices = {};
+  // Incrementing counter used to assign a stable, unique id to every
+  // picked file, independent of its position in the list.
+  int _nextId = 0;
+
+  // Id of the currently loaded track, or null if none. Using an id instead
+  // of a list index means reordering/removing tracks never invalidates
+  // which track is considered "current".
+  int? _currentTrackId;
+
+  bool _isLoading = false;
 
   double _speed = 1.0;
   double _volume = 1.0;
@@ -167,6 +186,15 @@ class _RootShellState extends State<RootShell> {
 
   bool get _isNightcoreActive =>
       (_speed - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
+
+  /// The currently loaded queue item, or null if none / it was removed.
+  QueueItem? get _currentItem {
+    if (_currentTrackId == null) return null;
+    for (final item in _queue) {
+      if (item.id == _currentTrackId) return item;
+    }
+    return null;
+  }
 
   @override
   void dispose() {
@@ -195,34 +223,40 @@ class _RootShellState extends State<RootShell> {
 
       if (result == null || result.files.isEmpty) return;
 
+      final newItems = result.files
+          .map((f) => QueueItem(id: _nextId++, file: f))
+          .toList();
+
       setState(() {
-        _queue.addAll(result.files);
+        _queue.addAll(newItems);
       });
 
-      if (wasQueueEmpty) {
-        await _loadTrack(0);
+      if (wasQueueEmpty && newItems.isNotEmpty) {
+        await _loadTrackById(newItems.first.id);
       }
     } catch (e) {
       _showError('Failed to open file picker: ${describeError(e)}');
     }
   }
 
-  /// Loads the track at [index] into the audio engine. On failure, the
-  /// selection rolls back to whatever was previously loaded (or null),
-  /// the failed index is flagged in the queue UI, and the track remains
-  /// in the queue for the user to retry or ignore.
-  Future<void> _loadTrack(int index) async {
-    if (index < 0 || index >= _queue.length) return;
+  /// Loads the queue item identified by [id] into the audio engine.
+  Future<void> _loadTrackById(int id) async {
+    QueueItem? target;
+    for (final item in _queue) {
+      if (item.id == id) {
+        target = item;
+        break;
+      }
+    }
+    if (target == null) return;
 
-    final file = _queue[index];
-    final path = file.path;
-    final previousIndex = _currentIndex;
+    final path = target.file.path;
+    final previousTrackId = _currentTrackId;
 
     if (path == null) {
       _handleLoadFailure(
-        index: index,
-        previousIndex: previousIndex,
-        fileName: file.name,
+        target: target,
+        previousTrackId: previousTrackId,
         message: 'Could not resolve a valid file path.',
       );
       return;
@@ -230,8 +264,8 @@ class _RootShellState extends State<RootShell> {
 
     setState(() {
       _isLoading = true;
-      _currentIndex = index;
-      _loadErrorIndices.remove(index);
+      _currentTrackId = id;
+      target!.hasError = false;
     });
 
     try {
@@ -243,17 +277,17 @@ class _RootShellState extends State<RootShell> {
           );
         },
       );
-      // Re-apply speed & pitch, since some platforms reset them on load.
       await _player.setSpeed(_speed);
       await _player.setPitch(_speed);
     } catch (e) {
       _handleLoadFailure(
-        index: index,
-        previousIndex: previousIndex,
-        fileName: file.name,
+        target: target,
+        previousTrackId: previousTrackId,
         message: describeError(e),
       );
     } finally {
+      // Guard against the item having been removed from the queue while
+      // the load was in flight.
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -262,25 +296,70 @@ class _RootShellState extends State<RootShell> {
     }
   }
 
-  /// Marks [index] as failed, reverts the active selection to whatever was
-  /// loaded before the attempt, and surfaces a descriptive error message.
+  /// Marks [target] as failed, reverts the active selection to whatever
+  /// was loaded before the attempt, and surfaces a descriptive error.
   void _handleLoadFailure({
-    required int index,
-    required int? previousIndex,
-    required String fileName,
+    required QueueItem target,
+    required int? previousTrackId,
     required String message,
   }) {
     if (!mounted) return;
     setState(() {
-      _loadErrorIndices.add(index);
-      _currentIndex = previousIndex;
+      target.hasError = true;
+      _currentTrackId = previousTrackId;
       _isLoading = false;
     });
-    _showError('Couldn\'t load "${stripExtension(fileName)}": $message');
+    _showError('Couldn\'t load "${stripExtension(target.file.name)}": $message');
+  }
+
+  /// Removes the queue item with [id]. If it was the currently loaded
+  /// track, playback is stopped and the "current track" is cleared.
+  Future<void> _removeTrack(int id) async {
+    final wasCurrent = _currentTrackId == id;
+
+    setState(() {
+      _queue.removeWhere((item) => item.id == id);
+    });
+
+    if (wasCurrent) {
+      setState(() {
+        _currentTrackId = null;
+      });
+      try {
+        await _player.pause();
+        await _player.seek(Duration.zero);
+      } catch (_) {
+        // Nothing meaningful to do if this fails during teardown.
+      }
+    }
+  }
+
+  /// Reorders the queue. Since the current track is tracked by id rather
+  /// than index, no extra bookkeeping is needed here.
+  void _reorderQueue(int oldIndex, int newIndex) {
+    setState(() {
+      if (newIndex > oldIndex) newIndex -= 1;
+      final item = _queue.removeAt(oldIndex);
+      _queue.insert(newIndex, item);
+    });
+  }
+
+  /// Clears the entire queue and stops playback.
+  Future<void> _clearQueue() async {
+    setState(() {
+      _queue.clear();
+      _currentTrackId = null;
+    });
+    try {
+      await _player.pause();
+      await _player.seek(Duration.zero);
+    } catch (_) {
+      // Nothing meaningful to do if this fails during teardown.
+    }
   }
 
   Future<void> _togglePlayPause() async {
-    if (_currentIndex == null) return;
+    if (_currentTrackId == null) return;
     try {
       if (_player.playing) {
         await _player.pause();
@@ -293,7 +372,7 @@ class _RootShellState extends State<RootShell> {
   }
 
   Future<void> _stopPlayback() async {
-    if (_currentIndex == null) return;
+    if (_currentTrackId == null) return;
     try {
       await _player.pause();
       await _player.seek(Duration.zero);
@@ -351,11 +430,11 @@ class _RootShellState extends State<RootShell> {
 
   @override
   Widget build(BuildContext context) {
-    final currentFile = _currentIndex != null ? _queue[_currentIndex!] : null;
+    final currentItem = _currentItem;
 
     final tabs = [
       PlayerScreen(
-        currentTrackName: currentFile?.name,
+        currentTrackName: currentItem?.file.name,
         isLoading: _isLoading,
         player: _player,
         speed: _speed,
@@ -370,11 +449,14 @@ class _RootShellState extends State<RootShell> {
       ),
       QueueScreen(
         queue: _queue,
-        currentIndex: _currentIndex,
+        currentTrackId: _currentTrackId,
         isLoading: _isLoading,
-        errorIndices: _loadErrorIndices,
+        player: _player,
         onAddPressed: _pickAudioFiles,
-        onTrackTapped: _loadTrack,
+        onTrackTapped: _loadTrackById,
+        onTrackRemoved: _removeTrack,
+        onReorder: _reorderQueue,
+        onClearAll: _clearQueue,
       ),
     ];
 
@@ -607,15 +689,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         child: Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
+                            // Guarded by hasTrack so stale stream values from
+                            // a previously-loaded (now cleared) track never
+                            // display once the queue item is gone.
                             Text(
-                              formatDuration(displayPosition),
+                              hasTrack ? formatDuration(displayPosition) : '0:00',
                               style: const TextStyle(
                                 color: AppColors.textSecondary,
                                 fontSize: 12,
                               ),
                             ),
                             Text(
-                              formatDuration(duration),
+                              hasTrack ? formatDuration(duration) : '--:--',
                               style: const TextStyle(
                                 color: AppColors.textSecondary,
                                 fontSize: 12,
@@ -818,22 +903,88 @@ class _NightcoreToggleChip extends StatelessWidget {
   }
 }
 
+/// A small animated 3-bar equalizer visual, shown next to the active track
+/// while it's actively playing. Purely decorative/lightweight — driven by
+/// a single looping AnimationController with phase-shifted sine waves per
+/// bar, avoiding any real audio analysis (kept intentionally simple, per
+/// the "lightweight visualizer" spirit planned for Phase 17).
+class _EqualizerBars extends StatefulWidget {
+  final Color color;
+
+  const _EqualizerBars({required this.color});
+
+  @override
+  State<_EqualizerBars> createState() => _EqualizerBarsState();
+}
+
+class _EqualizerBarsState extends State<_EqualizerBars>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(3, (i) {
+            final phase = _controller.value * 2 * math.pi + (i * 2.1);
+            final heightFactor = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(phase));
+            return Container(
+              width: 3,
+              height: 14 * heightFactor,
+              margin: const EdgeInsets.symmetric(horizontal: 1),
+              decoration: BoxDecoration(
+                color: widget.color,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            );
+          }),
+        );
+      },
+    );
+  }
+}
+
 class QueueScreen extends StatelessWidget {
-  final List<PlatformFile> queue;
-  final int? currentIndex;
+  final List<QueueItem> queue;
+  final int? currentTrackId;
   final bool isLoading;
-  final Set<int> errorIndices;
+  final AudioPlayer player;
   final VoidCallback onAddPressed;
   final ValueChanged<int> onTrackTapped;
+  final ValueChanged<int> onTrackRemoved;
+  final void Function(int oldIndex, int newIndex) onReorder;
+  final VoidCallback onClearAll;
 
   const QueueScreen({
     super.key,
     required this.queue,
-    required this.currentIndex,
+    required this.currentTrackId,
     required this.isLoading,
-    required this.errorIndices,
+    required this.player,
     required this.onAddPressed,
     required this.onTrackTapped,
+    required this.onTrackRemoved,
+    required this.onReorder,
+    required this.onClearAll,
   });
 
   String _formatFileSize(int bytes) {
@@ -843,6 +994,37 @@ class QueueScreen extends StatelessWidget {
     if (i >= suffixes.length) i = suffixes.length - 1;
     final size = bytes / (1 << (i * 10));
     return '${size.toStringAsFixed(1)} ${suffixes[i]}';
+  }
+
+  Future<void> _confirmClearAll(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text(
+          'Clear queue?',
+          style: TextStyle(color: AppColors.textPrimary),
+        ),
+        content: const Text(
+          'This will remove all tracks from the queue and stop playback.',
+          style: TextStyle(color: AppColors.textSecondary),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel', style: TextStyle(color: AppColors.textSecondary)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Clear All', style: TextStyle(color: AppColors.accentRed)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      onClearAll();
+    }
   }
 
   @override
@@ -863,9 +1045,27 @@ class QueueScreen extends StatelessWidget {
                         fontWeight: FontWeight.bold,
                       ),
                 ),
-                Text(
-                  '${queue.length} track${queue.length == 1 ? '' : 's'}',
-                  style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
+                Row(
+                  children: [
+                    Text(
+                      '${queue.length} track${queue.length == 1 ? '' : 's'}',
+                      style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
+                    ),
+                    if (queue.isNotEmpty) ...[
+                      const SizedBox(width: 12),
+                      GestureDetector(
+                        onTap: () => _confirmClearAll(context),
+                        child: const Text(
+                          'Clear All',
+                          style: TextStyle(
+                            color: AppColors.accentRed,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               ],
             ),
@@ -873,68 +1073,113 @@ class QueueScreen extends StatelessWidget {
           Expanded(
             child: queue.isEmpty
                 ? const _EmptyQueueState()
-                : ListView.separated(
+                : ReorderableListView.builder(
+                    buildDefaultDragHandles: false,
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                     itemCount: queue.length,
-                    separatorBuilder: (_, __) => const SizedBox(height: 4),
+                    onReorder: onReorder,
                     itemBuilder: (context, index) {
-                      final file = queue[index];
-                      final isActive = index == currentIndex;
+                      final item = queue[index];
+                      final isActive = item.id == currentTrackId;
                       final isActiveLoading = isActive && isLoading;
-                      final hasError = errorIndices.contains(index);
+                      final hasError = item.hasError;
 
-                      return ListTile(
-                        onTap: () => onTrackTapped(index),
-                        selected: isActive && !hasError,
-                        selectedTileColor: AppColors.surface,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          side: hasError
-                              ? const BorderSide(color: AppColors.accentRed, width: 1)
-                              : BorderSide.none,
-                        ),
-                        leading: CircleAvatar(
-                          backgroundColor: hasError
-                              ? AppColors.accentRed.withValues(alpha: 0.15)
-                              : (isActive ? AppColors.accentGreen : AppColors.surface),
-                          child: isActiveLoading
-                              ? const SizedBox(
-                                  width: 16,
-                                  height: 16,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    color: Colors.black,
-                                  ),
-                                )
-                              : Icon(
-                                  hasError
-                                      ? Icons.error_outline
-                                      : (isActive ? Icons.graphic_eq : Icons.music_note),
-                                  color: hasError
-                                      ? AppColors.accentRed
-                                      : (isActive ? Colors.black : AppColors.textSecondary),
-                                  size: 20,
-                                ),
-                        ),
-                        title: Text(
-                          stripExtension(file.name),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: hasError
-                                ? AppColors.accentRed
-                                : (isActive ? AppColors.accentGreen : AppColors.textPrimary),
-                            fontSize: 14,
-                            fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
+                      return Padding(
+                        key: ValueKey(item.id),
+                        padding: const EdgeInsets.only(bottom: 4),
+                        child: Dismissible(
+                          key: ValueKey('dismiss_${item.id}'),
+                          direction: DismissDirection.endToStart,
+                          background: Container(
+                            alignment: Alignment.centerRight,
+                            padding: const EdgeInsets.only(right: 20),
+                            decoration: BoxDecoration(
+                              color: AppColors.accentRed,
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: const Icon(Icons.delete_outline, color: Colors.white),
                           ),
-                        ),
-                        subtitle: Text(
-                          hasError
-                              ? 'Failed to load — tap to retry'
-                              : _formatFileSize(file.size),
-                          style: TextStyle(
-                            color: hasError ? AppColors.accentRed : AppColors.textSecondary,
-                            fontSize: 12,
+                          onDismissed: (_) => onTrackRemoved(item.id),
+                          child: ListTile(
+                            onTap: () => onTrackTapped(item.id),
+                            selected: isActive && !hasError,
+                            selectedTileColor: AppColors.surface,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                              side: hasError
+                                  ? const BorderSide(color: AppColors.accentRed, width: 1)
+                                  : BorderSide.none,
+                            ),
+                            leading: CircleAvatar(
+                              backgroundColor: hasError
+                                  ? AppColors.accentRed.withValues(alpha: 0.15)
+                                  : (isActive ? AppColors.accentGreen : AppColors.surface),
+                              child: isActiveLoading
+                                  ? const SizedBox(
+                                      width: 16,
+                                      height: 16,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.black,
+                                      ),
+                                    )
+                                  : hasError
+                                      ? const Icon(
+                                          Icons.error_outline,
+                                          color: AppColors.accentRed,
+                                          size: 20,
+                                        )
+                                      : isActive
+                                          ? StreamBuilder<PlayerState>(
+                                              stream: player.playerStateStream,
+                                              builder: (context, snapshot) {
+                                                final playing = snapshot.data?.playing ?? false;
+                                                return playing
+                                                    ? const _EqualizerBars(color: Colors.black)
+                                                    : const Icon(
+                                                        Icons.graphic_eq,
+                                                        color: Colors.black,
+                                                        size: 20,
+                                                      );
+                                              },
+                                            )
+                                          : const Icon(
+                                              Icons.music_note,
+                                              color: AppColors.textSecondary,
+                                              size: 20,
+                                            ),
+                            ),
+                            title: Text(
+                              stripExtension(item.file.name),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: hasError
+                                    ? AppColors.accentRed
+                                    : (isActive ? AppColors.accentGreen : AppColors.textPrimary),
+                                fontSize: 14,
+                                fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
+                              ),
+                            ),
+                            subtitle: Text(
+                              hasError
+                                  ? 'Failed to load — tap to retry'
+                                  : _formatFileSize(item.file.size),
+                              style: TextStyle(
+                                color: hasError ? AppColors.accentRed : AppColors.textSecondary,
+                                fontSize: 12,
+                              ),
+                            ),
+                            trailing: ReorderableDragStartListener(
+                              index: index,
+                              child: const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 4),
+                                child: Icon(
+                                  Icons.drag_handle,
+                                  color: AppColors.textSecondary,
+                                ),
+                              ),
+                            ),
                           ),
                         ),
                       );
