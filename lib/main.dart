@@ -100,6 +100,10 @@ String describeError(Object error) {
     return 'Playback error (code ${error.code}): ${error.message ?? 'Unknown error'}';
   }
 
+  if (error is MissingPluginException) {
+    return 'This feature isn\'t available on the current build/platform.';
+  }
+
   if (error is PlatformException) {
     return 'Platform error: ${error.message ?? error.code}';
   }
@@ -177,6 +181,8 @@ class _RootShellState extends State<RootShell> {
   int? _currentTrackId;
 
   bool _isLoading = false;
+  bool _pitchSupported = true;
+  bool _pitchWarningShown = false;
 
   // Guards against re-entrant auto-advance calls if the completed state
   // fires more than once in quick succession.
@@ -296,8 +302,7 @@ class _RootShellState extends State<RootShell> {
           );
         },
       );
-      await _player.setSpeed(_speed);
-      await _player.setPitch(_speed);
+      await _applySpeedAndPitch(_speed);
 
       if (autoPlay) {
         await _player.play();
@@ -456,10 +461,28 @@ class _RootShellState extends State<RootShell> {
       _speed = newSpeed;
     });
     try {
-      await _player.setSpeed(newSpeed);
-      await _player.setPitch(newSpeed);
+      await _applySpeedAndPitch(newSpeed);
     } catch (e) {
       _showError('Failed to change speed/pitch: ${describeError(e)}');
+    }
+  }
+
+  Future<void> _applySpeedAndPitch(double value) async {
+    await _player.setSpeed(value);
+
+    if (!_pitchSupported) return;
+
+    try {
+      await _player.setPitch(value);
+    } on MissingPluginException {
+      _pitchSupported = false;
+      if (!_pitchWarningShown) {
+        _pitchWarningShown = true;
+        _showError(
+          'Pitch shifting isn\'t available on this build/platform. '
+          'Speed will still change tempo, but pitch will stay constant.',
+        );
+      }
     }
   }
 
