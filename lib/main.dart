@@ -173,16 +173,20 @@ class _RootShellState extends State<RootShell> {
   // picked file, independent of its position in the list.
   int _nextId = 0;
 
-  // Id of the currently loaded track, or null if none. Using an id instead
-  // of a list index means reordering/removing tracks never invalidates
-  // which track is considered "current".
+  // Id of the currently loaded track, or null if none.
   int? _currentTrackId;
 
   bool _isLoading = false;
 
+  // Guards against re-entrant auto-advance calls if the completed state
+  // fires more than once in quick succession.
+  bool _isHandlingCompletion = false;
+
   double _speed = 1.0;
   double _volume = 1.0;
   double _volumeBeforeMute = 1.0;
+
+  StreamSubscription<PlayerState>? _playerStateSubscription;
 
   bool get _isNightcoreActive =>
       (_speed - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
@@ -197,7 +201,19 @@ class _RootShellState extends State<RootShell> {
   }
 
   @override
+  void initState() {
+    super.initState();
+    // Listen for track completion to drive auto-advance to the next track.
+    _playerStateSubscription = _player.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed) {
+        _handleTrackCompleted();
+      }
+    });
+  }
+
+  @override
   void dispose() {
+    _playerStateSubscription?.cancel();
     _player.dispose();
     super.dispose();
   }
@@ -232,7 +248,9 @@ class _RootShellState extends State<RootShell> {
       });
 
       if (wasQueueEmpty && newItems.isNotEmpty) {
-        await _loadTrackById(newItems.first.id);
+        // Initial load stays paused — the user hasn't explicitly asked to
+        // play yet, they've just picked files.
+        await _loadTrackById(newItems.first.id, autoPlay: false);
       }
     } catch (e) {
       _showError('Failed to open file picker: ${describeError(e)}');
@@ -240,7 +258,8 @@ class _RootShellState extends State<RootShell> {
   }
 
   /// Loads the queue item identified by [id] into the audio engine.
-  Future<void> _loadTrackById(int id) async {
+  /// If [autoPlay] is true, playback starts automatically once loaded.
+  Future<void> _loadTrackById(int id, {bool autoPlay = false}) async {
     QueueItem? target;
     for (final item in _queue) {
       if (item.id == id) {
@@ -279,6 +298,10 @@ class _RootShellState extends State<RootShell> {
       );
       await _player.setSpeed(_speed);
       await _player.setPitch(_speed);
+
+      if (autoPlay) {
+        await _player.play();
+      }
     } catch (e) {
       _handleLoadFailure(
         target: target,
@@ -286,8 +309,6 @@ class _RootShellState extends State<RootShell> {
         message: describeError(e),
       );
     } finally {
-      // Guard against the item having been removed from the queue while
-      // the load was in flight.
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -310,6 +331,55 @@ class _RootShellState extends State<RootShell> {
       _isLoading = false;
     });
     _showError('Couldn\'t load "${stripExtension(target.file.name)}": $message');
+  }
+
+  /// Called whenever the engine reports the current track has finished
+  /// playing naturally. Advances to the next track in the current visual
+  /// queue order, if one exists. If the finished track was the last one
+  /// in the queue, playback simply stops (no looping back to the start).
+  Future<void> _handleTrackCompleted() async {
+    if (_isHandlingCompletion) return;
+    if (_currentTrackId == null) return;
+
+    final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
+    if (currentIndex == -1) return;
+
+    // Last track in the queue — nothing to advance to, playback stops.
+    if (currentIndex >= _queue.length - 1) return;
+
+    _isHandlingCompletion = true;
+    try {
+      final nextItem = _queue[currentIndex + 1];
+      await _loadTrackById(nextItem.id, autoPlay: true);
+    } finally {
+      _isHandlingCompletion = false;
+    }
+  }
+
+  /// Skips to the next track in the current visual queue order, wrapping
+  /// around to the first track if currently on the last one. Preserves
+  /// whatever play/pause state was active before the skip.
+  Future<void> _skipToNext() async {
+    if (_queue.isEmpty || _currentTrackId == null) return;
+    final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
+    if (currentIndex == -1) return;
+
+    final wasPlaying = _player.playing;
+    final nextIndex = (currentIndex + 1) % _queue.length;
+    await _loadTrackById(_queue[nextIndex].id, autoPlay: wasPlaying);
+  }
+
+  /// Skips to the previous track in the current visual queue order,
+  /// wrapping around to the last track if currently on the first one.
+  /// Preserves whatever play/pause state was active before the skip.
+  Future<void> _skipToPrevious() async {
+    if (_queue.isEmpty || _currentTrackId == null) return;
+    final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
+    if (currentIndex == -1) return;
+
+    final wasPlaying = _player.playing;
+    final previousIndex = (currentIndex - 1 + _queue.length) % _queue.length;
+    await _loadTrackById(_queue[previousIndex].id, autoPlay: wasPlaying);
   }
 
   /// Removes the queue item with [id]. If it was the currently loaded
@@ -442,6 +512,8 @@ class _RootShellState extends State<RootShell> {
         volume: _volume,
         onPlayPause: _togglePlayPause,
         onStop: _stopPlayback,
+        onSkipNext: _skipToNext,
+        onSkipPrevious: _skipToPrevious,
         onSpeedChanged: _setSpeed,
         onToggleNightcore: _toggleNightcoreMode,
         onVolumeChanged: _setVolume,
@@ -453,7 +525,9 @@ class _RootShellState extends State<RootShell> {
         isLoading: _isLoading,
         player: _player,
         onAddPressed: _pickAudioFiles,
-        onTrackTapped: _loadTrackById,
+        // Manual queue selection always forces playback to start, per the
+        // agreed "seamless replace" behavior.
+        onTrackTapped: (id) => _loadTrackById(id, autoPlay: true),
         onTrackRemoved: _removeTrack,
         onReorder: _reorderQueue,
         onClearAll: _clearQueue,
@@ -491,6 +565,8 @@ class PlayerScreen extends StatefulWidget {
   final double volume;
   final VoidCallback onPlayPause;
   final VoidCallback onStop;
+  final VoidCallback onSkipNext;
+  final VoidCallback onSkipPrevious;
   final ValueChanged<double> onSpeedChanged;
   final VoidCallback onToggleNightcore;
   final ValueChanged<double> onVolumeChanged;
@@ -506,6 +582,8 @@ class PlayerScreen extends StatefulWidget {
     required this.volume,
     required this.onPlayPause,
     required this.onStop,
+    required this.onSkipNext,
+    required this.onSkipPrevious,
     required this.onSpeedChanged,
     required this.onToggleNightcore,
     required this.onVolumeChanged,
@@ -689,9 +767,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         child: Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            // Guarded by hasTrack so stale stream values from
-                            // a previously-loaded (now cleared) track never
-                            // display once the queue item is gone.
                             Text(
                               hasTrack ? formatDuration(displayPosition) : '0:00',
                               style: const TextStyle(
@@ -813,6 +888,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 8),
 
+          // Playback controls row — skip previous/next are now fully
+          // functional, wrapping around the queue's current visual order.
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
@@ -822,7 +899,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 color: AppColors.textSecondary,
                 iconSize: 26,
               ),
-              const Icon(Icons.skip_previous_rounded, color: AppColors.surfaceLight, size: 36),
+              GestureDetector(
+                onTap: widget.onSkipPrevious,
+                child: const Icon(
+                  Icons.skip_previous_rounded,
+                  color: AppColors.textPrimary,
+                  size: 36,
+                ),
+              ),
               StreamBuilder<PlayerState>(
                 stream: widget.player.playerStateStream,
                 builder: (context, snapshot) {
@@ -845,7 +929,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   );
                 },
               ),
-              const Icon(Icons.skip_next_rounded, color: AppColors.surfaceLight, size: 36),
+              GestureDetector(
+                onTap: widget.onSkipNext,
+                child: const Icon(
+                  Icons.skip_next_rounded,
+                  color: AppColors.textPrimary,
+                  size: 36,
+                ),
+              ),
+              // Repeat — decorative placeholder, not part of current roadmap scope.
               const Icon(Icons.repeat, color: AppColors.surfaceLight, size: 24),
             ],
           ),
@@ -904,10 +996,7 @@ class _NightcoreToggleChip extends StatelessWidget {
 }
 
 /// A small animated 3-bar equalizer visual, shown next to the active track
-/// while it's actively playing. Purely decorative/lightweight — driven by
-/// a single looping AnimationController with phase-shifted sine waves per
-/// bar, avoiding any real audio analysis (kept intentionally simple, per
-/// the "lightweight visualizer" spirit planned for Phase 17).
+/// while it's actively playing. Purely decorative/lightweight.
 class _EqualizerBars extends StatefulWidget {
   final Color color;
 
