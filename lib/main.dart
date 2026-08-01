@@ -1,11 +1,9 @@
-import 'dart:async';
-import 'dart:io';
 import 'dart:math' as math;
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+
+import 'player_controller.dart';
 
 void main() {
   runApp(const NightcorePlayerApp());
@@ -22,42 +20,8 @@ class AppColors {
   static const textSecondary = Color(0xFFB3B3B3);
 }
 
-// Supported audio file extensions for the picker.
-const List<String> kSupportedAudioExtensions = [
-  'mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac',
-];
-
-// Speed & pitch control bounds and step size.
-const double kMinSpeed = 0.5;
-const double kMaxSpeed = 2.0;
-const double kSpeedStep = 0.05;
-final int kSpeedDivisions = ((kMaxSpeed - kMinSpeed) / kSpeedStep).round(); // 30
-
-// The standard Nightcore preset multiplier applied to both speed and pitch.
-const double kNightcoreSpeed = 1.25;
-
-// Tolerance used when comparing floating-point speed values.
-const double kSpeedCompareTolerance = 0.001;
-
-// Maximum time to wait for a track to load before treating it as failed.
-const int kLoadTimeoutSeconds = 15;
-
-/// A single entry in the playback queue. Wraps a [PlatformFile] with a
-/// stable [id] (so it can be tracked across reordering/removal) and a
-/// mutable error flag for load-failure feedback.
-class QueueItem {
-  final int id;
-  final PlatformFile file;
-  bool hasError;
-
-  QueueItem({
-    required this.id,
-    required this.file,
-    this.hasError = false,
-  });
-}
-
 /// Strips the file extension from a file name for cleaner display.
+/// E.g. "song.mp3" -> "song". If there's no extension, returns as-is.
 String stripExtension(String fileName) {
   final lastDot = fileName.lastIndexOf('.');
   if (lastDot <= 0) return fileName;
@@ -78,42 +42,6 @@ String formatSpeed(double speed) => '${speed.toStringAsFixed(2)}x';
 
 /// Formats a 0.0–1.0 volume level as a percentage string, e.g. "100%".
 String formatVolumePercent(double volume) => '${(volume * 100).round()}%';
-
-/// Translates a raised exception into a short, user-friendly message.
-String describeError(Object error) {
-  if (error is TimeoutException) {
-    return 'Loading timed out. The file may be corrupted, too large, or inaccessible.';
-  }
-
-  if (error is PlayerException) {
-    final msg = (error.message ?? '').toLowerCase();
-    if (msg.contains('source error') ||
-        msg.contains('unsupported') ||
-        msg.contains('decoder')) {
-      return 'Unsupported or corrupted audio format.';
-    }
-    if (msg.contains('no such file') ||
-        msg.contains('enoent') ||
-        msg.contains('not found')) {
-      return 'File not found. It may have been moved or deleted.';
-    }
-    return 'Playback error (code ${error.code}): ${error.message ?? 'Unknown error'}';
-  }
-
-  if (error is MissingPluginException) {
-    return 'This feature isn\'t available on the current build/platform.';
-  }
-
-  if (error is PlatformException) {
-    return 'Platform error: ${error.message ?? error.code}';
-  }
-
-  if (error is FileSystemException) {
-    return 'File not found. It may have been moved or deleted.';
-  }
-
-  return 'Unexpected error: $error';
-}
 
 /// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
@@ -157,9 +85,9 @@ class NightcorePlayerApp extends StatelessWidget {
 }
 
 /// The root shell hosting the bottom navigation bar and switching between
-/// the Player tab and the Queue tab. Also owns the queue state and the
-/// audio player instance for now, since it's the shared ancestor of both
-/// tabs. Will be extracted into a dedicated controller in Phase 15.
+/// the Player tab and the Queue tab. Owns the [PlayerController] instance
+/// (the single source of truth for all playback/queue state) and forwards
+/// its error stream to SnackBars.
 class RootShell extends StatefulWidget {
   const RootShell({super.key});
 
@@ -169,58 +97,23 @@ class RootShell extends StatefulWidget {
 
 class _RootShellState extends State<RootShell> {
   int _selectedIndex = 0;
-
-  final List<QueueItem> _queue = [];
-  final AudioPlayer _player = AudioPlayer();
-
-  // Incrementing counter used to assign a stable, unique id to every
-  // picked file, independent of its position in the list.
-  int _nextId = 0;
-
-  // Id of the currently loaded track, or null if none.
-  int? _currentTrackId;
-
-  bool _isLoading = false;
-  bool _pitchSupported = true;
-  bool _pitchWarningShown = false;
-
-  // Guards against re-entrant auto-advance calls if the completed state
-  // fires more than once in quick succession.
-  bool _isHandlingCompletion = false;
-
-  double _speed = 1.0;
-  double _volume = 1.0;
-  double _volumeBeforeMute = 1.0;
-
-  StreamSubscription<PlayerState>? _playerStateSubscription;
-
-  bool get _isNightcoreActive =>
-      (_speed - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
-
-  /// The currently loaded queue item, or null if none / it was removed.
-  QueueItem? get _currentItem {
-    if (_currentTrackId == null) return null;
-    for (final item in _queue) {
-      if (item.id == _currentTrackId) return item;
-    }
-    return null;
-  }
+  late final PlayerController _controller;
 
   @override
   void initState() {
     super.initState();
-    // Listen for track completion to drive auto-advance to the next track.
-    _playerStateSubscription = _player.playerStateStream.listen((state) {
-      if (state.processingState == ProcessingState.completed) {
-        _handleTrackCompleted();
-      }
+    _controller = PlayerController();
+    _controller.errors.listen((message) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
+      );
     });
   }
 
   @override
   void dispose() {
-    _playerStateSubscription?.cancel();
-    _player.dispose();
+    _controller.dispose();
     super.dispose();
   }
 
@@ -230,335 +123,26 @@ class _RootShellState extends State<RootShell> {
     });
   }
 
-  /// Opens the native file picker allowing multi-selection of audio files,
-  /// appends the results to the queue, and auto-loads the first file if
-  /// the queue was previously empty.
-  Future<void> _pickAudioFiles() async {
-    try {
-      final wasQueueEmpty = _queue.isEmpty;
-
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: kSupportedAudioExtensions,
-        allowMultiple: true,
-      );
-
-      if (result == null || result.files.isEmpty) return;
-
-      final newItems = result.files
-          .map((f) => QueueItem(id: _nextId++, file: f))
-          .toList();
-
-      setState(() {
-        _queue.addAll(newItems);
-      });
-
-      if (wasQueueEmpty && newItems.isNotEmpty) {
-        // Initial load stays paused — the user hasn't explicitly asked to
-        // play yet, they've just picked files.
-        await _loadTrackById(newItems.first.id, autoPlay: false);
-      }
-    } catch (e) {
-      _showError('Failed to open file picker: ${describeError(e)}');
-    }
-  }
-
-  /// Loads the queue item identified by [id] into the audio engine.
-  /// If [autoPlay] is true, playback starts automatically once loaded.
-  Future<void> _loadTrackById(int id, {bool autoPlay = false}) async {
-    QueueItem? target;
-    for (final item in _queue) {
-      if (item.id == id) {
-        target = item;
-        break;
-      }
-    }
-    if (target == null) return;
-
-    final path = target.file.path;
-    final previousTrackId = _currentTrackId;
-
-    if (path == null) {
-      _handleLoadFailure(
-        target: target,
-        previousTrackId: previousTrackId,
-        message: 'Could not resolve a valid file path.',
-      );
-      return;
-    }
-
-    setState(() {
-      _isLoading = true;
-      _currentTrackId = id;
-      target!.hasError = false;
-    });
-
-    try {
-      await _player.setFilePath(path).timeout(
-        const Duration(seconds: kLoadTimeoutSeconds),
-        onTimeout: () {
-          throw TimeoutException(
-            'Loading timed out after ${kLoadTimeoutSeconds}s',
-          );
-        },
-      );
-      await _applySpeedAndPitch(_speed);
-
-      if (autoPlay) {
-        await _player.play();
-      }
-    } catch (e) {
-      _handleLoadFailure(
-        target: target,
-        previousTrackId: previousTrackId,
-        message: describeError(e),
-      );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-        });
-      }
-    }
-  }
-
-  /// Marks [target] as failed, reverts the active selection to whatever
-  /// was loaded before the attempt, and surfaces a descriptive error.
-  void _handleLoadFailure({
-    required QueueItem target,
-    required int? previousTrackId,
-    required String message,
-  }) {
-    if (!mounted) return;
-    setState(() {
-      target.hasError = true;
-      _currentTrackId = previousTrackId;
-      _isLoading = false;
-    });
-    _showError('Couldn\'t load "${stripExtension(target.file.name)}": $message');
-  }
-
-  /// Called whenever the engine reports the current track has finished
-  /// playing naturally. Advances to the next track in the current visual
-  /// queue order, if one exists. If the finished track was the last one
-  /// in the queue, playback simply stops (no looping back to the start).
-  Future<void> _handleTrackCompleted() async {
-    if (_isHandlingCompletion) return;
-    if (_currentTrackId == null) return;
-
-    final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
-    if (currentIndex == -1) return;
-
-    // Last track in the queue — nothing to advance to, playback stops.
-    if (currentIndex >= _queue.length - 1) return;
-
-    _isHandlingCompletion = true;
-    try {
-      final nextItem = _queue[currentIndex + 1];
-      await _loadTrackById(nextItem.id, autoPlay: true);
-    } finally {
-      _isHandlingCompletion = false;
-    }
-  }
-
-  /// Skips to the next track in the current visual queue order, wrapping
-  /// around to the first track if currently on the last one. Preserves
-  /// whatever play/pause state was active before the skip.
-  Future<void> _skipToNext() async {
-    if (_queue.isEmpty || _currentTrackId == null) return;
-    final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
-    if (currentIndex == -1) return;
-
-    final wasPlaying = _player.playing;
-    final nextIndex = (currentIndex + 1) % _queue.length;
-    await _loadTrackById(_queue[nextIndex].id, autoPlay: wasPlaying);
-  }
-
-  /// Skips to the previous track in the current visual queue order,
-  /// wrapping around to the last track if currently on the first one.
-  /// Preserves whatever play/pause state was active before the skip.
-  Future<void> _skipToPrevious() async {
-    if (_queue.isEmpty || _currentTrackId == null) return;
-    final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
-    if (currentIndex == -1) return;
-
-    final wasPlaying = _player.playing;
-    final previousIndex = (currentIndex - 1 + _queue.length) % _queue.length;
-    await _loadTrackById(_queue[previousIndex].id, autoPlay: wasPlaying);
-  }
-
-  /// Removes the queue item with [id]. If it was the currently loaded
-  /// track, playback is stopped and the "current track" is cleared.
-  Future<void> _removeTrack(int id) async {
-    final wasCurrent = _currentTrackId == id;
-
-    setState(() {
-      _queue.removeWhere((item) => item.id == id);
-    });
-
-    if (wasCurrent) {
-      setState(() {
-        _currentTrackId = null;
-      });
-      try {
-        await _player.pause();
-        await _player.seek(Duration.zero);
-      } catch (_) {
-        // Nothing meaningful to do if this fails during teardown.
-      }
-    }
-  }
-
-  /// Reorders the queue. Since the current track is tracked by id rather
-  /// than index, no extra bookkeeping is needed here.
-  void _reorderQueue(int oldIndex, int newIndex) {
-    setState(() {
-      if (newIndex > oldIndex) newIndex -= 1;
-      final item = _queue.removeAt(oldIndex);
-      _queue.insert(newIndex, item);
-    });
-  }
-
-  /// Clears the entire queue and stops playback.
-  Future<void> _clearQueue() async {
-    setState(() {
-      _queue.clear();
-      _currentTrackId = null;
-    });
-    try {
-      await _player.pause();
-      await _player.seek(Duration.zero);
-    } catch (_) {
-      // Nothing meaningful to do if this fails during teardown.
-    }
-  }
-
-  Future<void> _togglePlayPause() async {
-    if (_currentTrackId == null) return;
-    try {
-      if (_player.playing) {
-        await _player.pause();
-      } else {
-        await _player.play();
-      }
-    } catch (e) {
-      _showError('Playback error: ${describeError(e)}');
-    }
-  }
-
-  Future<void> _stopPlayback() async {
-    if (_currentTrackId == null) return;
-    try {
-      await _player.pause();
-      await _player.seek(Duration.zero);
-    } catch (e) {
-      _showError('Playback error: ${describeError(e)}');
-    }
-  }
-
-  Future<void> _setSpeed(double newSpeed) async {
-    setState(() {
-      _speed = newSpeed;
-    });
-    try {
-      await _applySpeedAndPitch(newSpeed);
-    } catch (e) {
-      _showError('Failed to change speed/pitch: ${describeError(e)}');
-    }
-  }
-
-  Future<void> _applySpeedAndPitch(double value) async {
-    await _player.setSpeed(value);
-
-    if (!_pitchSupported) return;
-
-    try {
-      await _player.setPitch(value);
-    } on MissingPluginException {
-      _pitchSupported = false;
-      if (!_pitchWarningShown) {
-        _pitchWarningShown = true;
-        _showError(
-          'Pitch shifting isn\'t available on this build/platform. '
-          'Speed will still change tempo, but pitch will stay constant.',
-        );
-      }
-    }
-  }
-
-  void _toggleNightcoreMode() {
-    if (_isNightcoreActive) {
-      _setSpeed(1.0);
-    } else {
-      _setSpeed(kNightcoreSpeed);
-    }
-  }
-
-  Future<void> _setVolume(double newVolume) async {
-    setState(() {
-      _volume = newVolume;
-    });
-    try {
-      await _player.setVolume(newVolume);
-    } catch (e) {
-      _showError('Failed to change volume: ${describeError(e)}');
-    }
-  }
-
-  void _toggleMute() {
-    if (_volume > 0) {
-      _volumeBeforeMute = _volume;
-      _setVolume(0.0);
-    } else {
-      _setVolume(_volumeBeforeMute > 0 ? _volumeBeforeMute : 1.0);
-    }
-  }
-
-  void _showError(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    final currentItem = _currentItem;
-
-    final tabs = [
-      PlayerScreen(
-        currentTrackName: currentItem?.file.name,
-        isLoading: _isLoading,
-        player: _player,
-        speed: _speed,
-        isNightcoreActive: _isNightcoreActive,
-        volume: _volume,
-        onPlayPause: _togglePlayPause,
-        onStop: _stopPlayback,
-        onSkipNext: _skipToNext,
-        onSkipPrevious: _skipToPrevious,
-        onSpeedChanged: _setSpeed,
-        onToggleNightcore: _toggleNightcoreMode,
-        onVolumeChanged: _setVolume,
-        onToggleMute: _toggleMute,
-      ),
-      QueueScreen(
-        queue: _queue,
-        currentTrackId: _currentTrackId,
-        isLoading: _isLoading,
-        player: _player,
-        onAddPressed: _pickAudioFiles,
-        // Manual queue selection always forces playback to start, per the
-        // agreed "seamless replace" behavior.
-        onTrackTapped: (id) => _loadTrackById(id, autoPlay: true),
-        onTrackRemoved: _removeTrack,
-        onReorder: _reorderQueue,
-        onClearAll: _clearQueue,
-      ),
-    ];
-
     return Scaffold(
-      body: SafeArea(child: tabs[_selectedIndex]),
+      body: SafeArea(
+        // Rebuilds whenever the controller calls notifyListeners(), which
+        // covers queue changes, speed/volume/nightcore changes, loading
+        // state, and current-track changes. Real-time playback position is
+        // still handled separately via StreamBuilder inside PlayerScreen to
+        // avoid rebuilding the whole tree on every ~200ms position tick.
+        child: ListenableBuilder(
+          listenable: _controller,
+          builder: (context, _) {
+            final tabs = [
+              PlayerScreen(controller: _controller),
+              QueueScreen(controller: _controller),
+            ];
+            return tabs[_selectedIndex];
+          },
+        ),
+      ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,
         onTap: _onTabTapped,
@@ -580,56 +164,31 @@ class _RootShellState extends State<RootShell> {
 }
 
 class PlayerScreen extends StatefulWidget {
-  final String? currentTrackName;
-  final bool isLoading;
-  final AudioPlayer player;
-  final double speed;
-  final bool isNightcoreActive;
-  final double volume;
-  final VoidCallback onPlayPause;
-  final VoidCallback onStop;
-  final VoidCallback onSkipNext;
-  final VoidCallback onSkipPrevious;
-  final ValueChanged<double> onSpeedChanged;
-  final VoidCallback onToggleNightcore;
-  final ValueChanged<double> onVolumeChanged;
-  final VoidCallback onToggleMute;
+  final PlayerController controller;
 
-  const PlayerScreen({
-    super.key,
-    this.currentTrackName,
-    this.isLoading = false,
-    required this.player,
-    required this.speed,
-    required this.isNightcoreActive,
-    required this.volume,
-    required this.onPlayPause,
-    required this.onStop,
-    required this.onSkipNext,
-    required this.onSkipPrevious,
-    required this.onSpeedChanged,
-    required this.onToggleNightcore,
-    required this.onVolumeChanged,
-    required this.onToggleMute,
-  });
+  const PlayerScreen({super.key, required this.controller});
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
+  // Local drag state for the seek slider — purely a UI concern, not part
+  // of the shared controller state.
   bool _isDragging = false;
   Duration? _dragPosition;
   bool _wasPlayingBeforeDrag = false;
 
+  AudioPlayer get _player => widget.controller.player;
+
   void _onSeekStart(double value) {
-    _wasPlayingBeforeDrag = widget.player.playing;
+    _wasPlayingBeforeDrag = _player.playing;
     setState(() {
       _isDragging = true;
       _dragPosition = Duration(milliseconds: value.round());
     });
     if (_wasPlayingBeforeDrag) {
-      widget.player.pause();
+      _player.pause();
     }
   }
 
@@ -642,9 +201,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _onSeekEnd(double value) async {
     final seekTarget = Duration(milliseconds: value.round());
     try {
-      await widget.player.seek(seekTarget);
+      await _player.seek(seekTarget);
       if (_wasPlayingBeforeDrag) {
-        await widget.player.play();
+        await _player.play();
       }
     } catch (e) {
       if (mounted) {
@@ -669,8 +228,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final hasTrack = widget.currentTrackName != null;
-    final displayName = hasTrack ? stripExtension(widget.currentTrackName!) : null;
+    final controller = widget.controller;
+    final currentTrackName = controller.currentItem?.file.name;
+    final hasTrack = currentTrackName != null;
+    final displayName = hasTrack ? stripExtension(currentTrackName) : null;
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -694,7 +255,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ],
             ),
             child: Center(
-              child: widget.isLoading
+              child: controller.isLoading
                   ? const CircularProgressIndicator(color: AppColors.accentGreen)
                   : const Icon(
                       Icons.music_note_rounded,
@@ -720,7 +281,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           const SizedBox(height: 6),
 
           StreamBuilder<PlayerState>(
-            stream: widget.player.playerStateStream,
+            stream: _player.playerStateStream,
             builder: (context, snapshot) {
               final state = snapshot.data;
               final playing = state?.playing ?? false;
@@ -729,7 +290,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               String statusText;
               if (!hasTrack) {
                 statusText = 'Pick a file to get started';
-              } else if (widget.isLoading) {
+              } else if (controller.isLoading) {
                 statusText = 'Loading...';
               } else if (processingState == ProcessingState.completed) {
                 statusText = 'Finished';
@@ -753,14 +314,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
           const SizedBox(height: 16),
 
           StreamBuilder<Duration?>(
-            stream: widget.player.durationStream,
+            stream: _player.durationStream,
             builder: (context, durationSnapshot) {
               final duration = durationSnapshot.data;
               final maxMs = (duration?.inMilliseconds ?? 0).toDouble();
               final sliderEnabled = hasTrack && maxMs > 0;
 
               return StreamBuilder<Duration>(
-                stream: widget.player.positionStream,
+                stream: _player.positionStream,
                 builder: (context, positionSnapshot) {
                   final livePosition = positionSnapshot.data ?? Duration.zero;
                   final displayPosition =
@@ -824,20 +385,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   AnimatedSwitcher(
                     duration: const Duration(milliseconds: 200),
                     child: Text(
-                      widget.isNightcoreActive ? '⚡ Nightcore Mode' : 'Speed & Pitch',
-                      key: ValueKey(widget.isNightcoreActive),
+                      controller.isNightcoreActive ? '⚡ Nightcore Mode' : 'Speed & Pitch',
+                      key: ValueKey(controller.isNightcoreActive),
                       style: TextStyle(
-                        color: widget.isNightcoreActive
+                        color: controller.isNightcoreActive
                             ? AppColors.accentGreen
                             : AppColors.textSecondary,
                         fontSize: 13,
-                        fontWeight:
-                            widget.isNightcoreActive ? FontWeight.w700 : FontWeight.normal,
+                        fontWeight: controller.isNightcoreActive
+                            ? FontWeight.w700
+                            : FontWeight.normal,
                       ),
                     ),
                   ),
                   Text(
-                    formatSpeed(widget.speed),
+                    formatSpeed(controller.speed),
                     style: const TextStyle(
                       color: AppColors.accentGreen,
                       fontSize: 13,
@@ -852,17 +414,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
                 ),
                 child: Slider(
-                  value: widget.speed,
+                  value: controller.speed,
                   min: kMinSpeed,
                   max: kMaxSpeed,
                   divisions: kSpeedDivisions,
-                  onChanged: widget.onSpeedChanged,
+                  onChanged: controller.setSpeed,
                 ),
               ),
               const SizedBox(height: 4),
               _NightcoreToggleChip(
-                isActive: widget.isNightcoreActive,
-                onTap: widget.onToggleNightcore,
+                isActive: controller.isNightcoreActive,
+                onTap: controller.toggleNightcoreMode,
               ),
             ],
           ),
@@ -872,9 +434,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Row(
             children: [
               GestureDetector(
-                onTap: widget.onToggleMute,
+                onTap: controller.toggleMute,
                 child: Icon(
-                  _volumeIcon(widget.volume),
+                  _volumeIcon(controller.volume),
                   color: AppColors.textSecondary,
                   size: 22,
                 ),
@@ -887,10 +449,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
                   ),
                   child: Slider(
-                    value: widget.volume,
+                    value: controller.volume,
                     min: 0.0,
                     max: 1.0,
-                    onChanged: widget.onVolumeChanged,
+                    onChanged: controller.setVolume,
                   ),
                 ),
               ),
@@ -898,7 +460,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               SizedBox(
                 width: 38,
                 child: Text(
-                  formatVolumePercent(widget.volume),
+                  formatVolumePercent(controller.volume),
                   textAlign: TextAlign.right,
                   style: const TextStyle(
                     color: AppColors.textSecondary,
@@ -911,19 +473,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 8),
 
-          // Playback controls row — skip previous/next are now fully
-          // functional, wrapping around the queue's current visual order.
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
               IconButton(
-                onPressed: widget.onStop,
+                onPressed: controller.stopPlayback,
                 icon: const Icon(Icons.stop_rounded),
                 color: AppColors.textSecondary,
                 iconSize: 26,
               ),
               GestureDetector(
-                onTap: widget.onSkipPrevious,
+                onTap: controller.skipToPrevious,
                 child: const Icon(
                   Icons.skip_previous_rounded,
                   color: AppColors.textPrimary,
@@ -931,11 +491,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ),
               ),
               StreamBuilder<PlayerState>(
-                stream: widget.player.playerStateStream,
+                stream: _player.playerStateStream,
                 builder: (context, snapshot) {
                   final playing = snapshot.data?.playing ?? false;
                   return GestureDetector(
-                    onTap: widget.onPlayPause,
+                    onTap: controller.togglePlayPause,
                     child: Container(
                       width: 60,
                       height: 60,
@@ -953,14 +513,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 },
               ),
               GestureDetector(
-                onTap: widget.onSkipNext,
+                onTap: controller.skipToNext,
                 child: const Icon(
                   Icons.skip_next_rounded,
                   color: AppColors.textPrimary,
                   size: 36,
                 ),
               ),
-              // Repeat — decorative placeholder, not part of current roadmap scope.
               const Icon(Icons.repeat, color: AppColors.surfaceLight, size: 24),
             ],
           ),
@@ -1076,28 +635,9 @@ class _EqualizerBarsState extends State<_EqualizerBars>
 }
 
 class QueueScreen extends StatelessWidget {
-  final List<QueueItem> queue;
-  final int? currentTrackId;
-  final bool isLoading;
-  final AudioPlayer player;
-  final VoidCallback onAddPressed;
-  final ValueChanged<int> onTrackTapped;
-  final ValueChanged<int> onTrackRemoved;
-  final void Function(int oldIndex, int newIndex) onReorder;
-  final VoidCallback onClearAll;
+  final PlayerController controller;
 
-  const QueueScreen({
-    super.key,
-    required this.queue,
-    required this.currentTrackId,
-    required this.isLoading,
-    required this.player,
-    required this.onAddPressed,
-    required this.onTrackTapped,
-    required this.onTrackRemoved,
-    required this.onReorder,
-    required this.onClearAll,
-  });
+  const QueueScreen({super.key, required this.controller});
 
   String _formatFileSize(int bytes) {
     if (bytes <= 0) return '';
@@ -1135,12 +675,14 @@ class QueueScreen extends StatelessWidget {
     );
 
     if (confirmed == true) {
-      onClearAll();
+      controller.clearQueue();
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final queue = controller.queue;
+
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Column(
@@ -1189,11 +731,11 @@ class QueueScreen extends StatelessWidget {
                     buildDefaultDragHandles: false,
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                     itemCount: queue.length,
-                    onReorder: onReorder,
+                    onReorder: controller.reorderQueue,
                     itemBuilder: (context, index) {
                       final item = queue[index];
-                      final isActive = item.id == currentTrackId;
-                      final isActiveLoading = isActive && isLoading;
+                      final isActive = item.id == controller.currentTrackId;
+                      final isActiveLoading = isActive && controller.isLoading;
                       final hasError = item.hasError;
 
                       return Padding(
@@ -1211,9 +753,9 @@ class QueueScreen extends StatelessWidget {
                             ),
                             child: const Icon(Icons.delete_outline, color: Colors.white),
                           ),
-                          onDismissed: (_) => onTrackRemoved(item.id),
+                          onDismissed: (_) => controller.removeTrack(item.id),
                           child: ListTile(
-                            onTap: () => onTrackTapped(item.id),
+                            onTap: () => controller.loadTrackById(item.id, autoPlay: true),
                             selected: isActive && !hasError,
                             selectedTileColor: AppColors.surface,
                             shape: RoundedRectangleBorder(
@@ -1243,7 +785,7 @@ class QueueScreen extends StatelessWidget {
                                         )
                                       : isActive
                                           ? StreamBuilder<PlayerState>(
-                                              stream: player.playerStateStream,
+                                              stream: controller.player.playerStateStream,
                                               builder: (context, snapshot) {
                                                 final playing = snapshot.data?.playing ?? false;
                                                 return playing
@@ -1301,7 +843,7 @@ class QueueScreen extends StatelessWidget {
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: onAddPressed,
+        onPressed: controller.pickAudioFiles,
         backgroundColor: AppColors.accentGreen,
         foregroundColor: Colors.black,
         icon: const Icon(Icons.add),
