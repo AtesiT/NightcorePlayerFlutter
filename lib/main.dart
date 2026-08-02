@@ -21,7 +21,6 @@ class AppColors {
 }
 
 /// Strips the file extension from a file name for cleaner display.
-/// E.g. "song.mp3" -> "song". If there's no extension, returns as-is.
 String stripExtension(String fileName) {
   final lastDot = fileName.lastIndexOf('.');
   if (lastDot <= 0) return fileName;
@@ -42,6 +41,19 @@ String formatSpeed(double speed) => '${speed.toStringAsFixed(2)}x';
 
 /// Formats a 0.0–1.0 volume level as a percentage string, e.g. "100%".
 String formatVolumePercent(double volume) => '${(volume * 100).round()}%';
+
+/// Shared transition used for track-change animations (album art, title):
+/// a gentle fade combined with a small upward slide.
+Widget _trackChangeTransition(Widget child, Animation<double> animation) {
+  final offsetAnim = Tween<Offset>(
+    begin: const Offset(0, 0.06),
+    end: Offset.zero,
+  ).animate(animation);
+  return FadeTransition(
+    opacity: animation,
+    child: SlideTransition(position: offsetAnim, child: child),
+  );
+}
 
 /// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
@@ -127,11 +139,6 @@ class _RootShellState extends State<RootShell> {
   Widget build(BuildContext context) {
     return Scaffold(
       body: SafeArea(
-        // Rebuilds whenever the controller calls notifyListeners(), which
-        // covers queue changes, speed/volume/nightcore changes, loading
-        // state, and current-track changes. Real-time playback position is
-        // still handled separately via StreamBuilder inside PlayerScreen to
-        // avoid rebuilding the whole tree on every ~200ms position tick.
         child: ListenableBuilder(
           listenable: _controller,
           builder: (context, _) {
@@ -139,7 +146,18 @@ class _RootShellState extends State<RootShell> {
               PlayerScreen(controller: _controller),
               QueueScreen(controller: _controller),
             ];
-            return tabs[_selectedIndex];
+            // Fades between the Player and Queue tabs. The key is based on
+            // _selectedIndex only, so repeated controller-driven rebuilds
+            // while staying on the same tab never retrigger the animation.
+            return AnimatedSwitcher(
+              duration: const Duration(milliseconds: 220),
+              transitionBuilder: (child, animation) =>
+                  FadeTransition(opacity: animation, child: child),
+              child: KeyedSubtree(
+                key: ValueKey(_selectedIndex),
+                child: tabs[_selectedIndex],
+              ),
+            );
           },
         ),
       ),
@@ -173,33 +191,33 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // Local drag state for the seek slider — purely a UI concern, not part
-  // of the shared controller state.
+  // Local drag state for the seek bar — purely a UI concern, not part of
+  // the shared controller state. Values are stored in milliseconds.
   bool _isDragging = false;
   Duration? _dragPosition;
   bool _wasPlayingBeforeDrag = false;
 
   AudioPlayer get _player => widget.controller.player;
 
-  void _onSeekStart(double value) {
+  void _onSeekStart(double valueMs) {
     _wasPlayingBeforeDrag = _player.playing;
     setState(() {
       _isDragging = true;
-      _dragPosition = Duration(milliseconds: value.round());
+      _dragPosition = Duration(milliseconds: valueMs.round());
     });
     if (_wasPlayingBeforeDrag) {
       _player.pause();
     }
   }
 
-  void _onSeekChanged(double value) {
+  void _onSeekChanged(double valueMs) {
     setState(() {
-      _dragPosition = Duration(milliseconds: value.round());
+      _dragPosition = Duration(milliseconds: valueMs.round());
     });
   }
 
-  Future<void> _onSeekEnd(double value) async {
-    final seekTarget = Duration(milliseconds: value.round());
+  Future<void> _onSeekEnd(double valueMs) async {
+    final seekTarget = Duration(milliseconds: valueMs.round());
     try {
       await _player.seek(seekTarget);
       if (_wasPlayingBeforeDrag) {
@@ -232,6 +250,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final currentTrackName = controller.currentItem?.file.name;
     final hasTrack = currentTrackName != null;
     final displayName = hasTrack ? stripExtension(currentTrackName) : null;
+    // Used to key track-change animations — falls back to -1 when nothing
+    // is loaded so the "No track loaded" state also animates in/out.
+    final trackKey = ValueKey(controller.currentTrackId ?? -1);
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -240,43 +261,56 @@ class _PlayerScreenState extends State<PlayerScreen> {
         children: [
           const Spacer(flex: 2),
 
-          Container(
-            width: 220,
-            height: 220,
-            decoration: BoxDecoration(
-              color: AppColors.surface,
-              borderRadius: BorderRadius.circular(16),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.4),
-                  blurRadius: 20,
-                  offset: const Offset(0, 10),
-                ),
-              ],
-            ),
-            child: Center(
-              child: controller.isLoading
-                  ? const CircularProgressIndicator(color: AppColors.accentGreen)
-                  : const Icon(
-                      Icons.music_note_rounded,
-                      size: 90,
-                      color: AppColors.textSecondary,
-                    ),
+          // Album art placeholder — fades/slides in whenever the active
+          // track changes (including the moment loading begins).
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            transitionBuilder: _trackChangeTransition,
+            child: Container(
+              key: trackKey,
+              width: 220,
+              height: 220,
+              decoration: BoxDecoration(
+                color: AppColors.surface,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.4),
+                    blurRadius: 20,
+                    offset: const Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: Center(
+                child: controller.isLoading
+                    ? const CircularProgressIndicator(color: AppColors.accentGreen)
+                    : const Icon(
+                        Icons.music_note_rounded,
+                        size: 90,
+                        color: AppColors.textSecondary,
+                      ),
+              ),
             ),
           ),
 
           const Spacer(flex: 1),
 
-          Text(
-            displayName ?? 'No track loaded',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: AppColors.textPrimary,
-              fontSize: 20,
-              fontWeight: FontWeight.w600,
+          // Track title — same fade/slide treatment as the album art.
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            transitionBuilder: _trackChangeTransition,
+            child: Text(
+              displayName ?? 'No track loaded',
+              key: trackKey,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: AppColors.textPrimary,
+                fontSize: 20,
+                fontWeight: FontWeight.w600,
+              ),
+              textAlign: TextAlign.center,
             ),
-            textAlign: TextAlign.center,
           ),
           const SizedBox(height: 6),
 
@@ -313,12 +347,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 16),
 
+          // Custom seek bar — drag-only scrubbing (no tap-to-jump), built
+          // with a raw GestureDetector + CustomPainter instead of the
+          // standard Slider, which cannot distinguish a tap from a drag.
           StreamBuilder<Duration?>(
             stream: _player.durationStream,
             builder: (context, durationSnapshot) {
               final duration = durationSnapshot.data;
               final maxMs = (duration?.inMilliseconds ?? 0).toDouble();
-              final sliderEnabled = hasTrack && maxMs > 0;
+              final seekEnabled = hasTrack && maxMs > 0;
 
               return StreamBuilder<Duration>(
                 stream: _player.positionStream,
@@ -330,21 +367,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   final clampedMs = displayPosition.inMilliseconds
                       .clamp(0, maxMs > 0 ? maxMs.toInt() : 0)
                       .toDouble();
+                  final progress = seekEnabled && maxMs > 0 ? (clampedMs / maxMs) : 0.0;
 
                   return Column(
                     children: [
-                      SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          trackHeight: 3,
-                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                        ),
-                        child: Slider(
-                          value: sliderEnabled ? clampedMs : 0.0,
-                          max: sliderEnabled ? maxMs : 1.0,
-                          onChanged: sliderEnabled ? _onSeekChanged : null,
-                          onChangeStart: sliderEnabled ? _onSeekStart : null,
-                          onChangeEnd: sliderEnabled ? _onSeekEnd : null,
-                        ),
+                      _CustomSeekBar(
+                        progress: progress,
+                        enabled: seekEnabled,
+                        onDragStart: (p) => _onSeekStart(p * maxMs),
+                        onDragUpdate: (p) => _onSeekChanged(p * maxMs),
+                        onDragEnd: () =>
+                            _onSeekEnd(_dragPosition?.inMilliseconds.toDouble() ?? 0),
                       ),
                       Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 4.0),
@@ -490,6 +523,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   size: 36,
                 ),
               ),
+              // Play/Pause — icon transitions with a simple scale+fade pop
+              // instead of an instant swap.
               StreamBuilder<PlayerState>(
                 stream: _player.playerStateStream,
                 builder: (context, snapshot) {
@@ -499,14 +534,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     child: Container(
                       width: 60,
                       height: 60,
+                      alignment: Alignment.center,
                       decoration: const BoxDecoration(
                         color: AppColors.accentGreen,
                         shape: BoxShape.circle,
                       ),
-                      child: Icon(
-                        playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                        color: Colors.black,
-                        size: 34,
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 180),
+                        transitionBuilder: (child, animation) => ScaleTransition(
+                          scale: animation,
+                          child: FadeTransition(opacity: animation, child: child),
+                        ),
+                        child: Icon(
+                          playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                          key: ValueKey(playing),
+                          color: Colors.black,
+                          size: 34,
+                        ),
                       ),
                     ),
                   );
@@ -528,6 +572,122 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ],
       ),
     );
+  }
+}
+
+/// A custom, drag-only seek bar. Unlike the standard [Slider], a plain tap
+/// will NOT jump the playback position — Flutter's drag gesture recognizer
+/// requires the pointer to move past a small touch-slop threshold before
+/// firing onHorizontalDragStart, which naturally filters out simple taps
+/// while still allowing free scrubbing via drag.
+class _CustomSeekBar extends StatelessWidget {
+  final double progress; // 0.0 - 1.0
+  final bool enabled;
+  final ValueChanged<double>? onDragStart;
+  final ValueChanged<double>? onDragUpdate;
+  final VoidCallback? onDragEnd;
+
+  const _CustomSeekBar({
+    required this.progress,
+    required this.enabled,
+    this.onDragStart,
+    this.onDragUpdate,
+    this.onDragEnd,
+  });
+
+  double _progressFromDx(double dx, double width) {
+    if (width <= 0) return 0;
+    return (dx / width).clamp(0.0, 1.0);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onHorizontalDragStart: enabled
+              ? (details) =>
+                  onDragStart?.call(_progressFromDx(details.localPosition.dx, width))
+              : null,
+          onHorizontalDragUpdate: enabled
+              ? (details) =>
+                  onDragUpdate?.call(_progressFromDx(details.localPosition.dx, width))
+              : null,
+          onHorizontalDragEnd: enabled ? (_) => onDragEnd?.call() : null,
+          child: SizedBox(
+            height: 24,
+            width: double.infinity,
+            child: CustomPaint(
+              painter: _SeekBarPainter(
+                progress: progress,
+                enabled: enabled,
+                activeColor: AppColors.accentGreen,
+                inactiveColor: AppColors.surfaceLight,
+                thumbColor: AppColors.textPrimary,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Paints the seek bar track, filled progress, and thumb. When [enabled]
+/// is false, the whole track renders flat/inactive and no thumb is drawn
+/// — matching a disabled Slider's appearance.
+class _SeekBarPainter extends CustomPainter {
+  final double progress;
+  final bool enabled;
+  final Color activeColor;
+  final Color inactiveColor;
+  final Color thumbColor;
+
+  _SeekBarPainter({
+    required this.progress,
+    required this.enabled,
+    required this.activeColor,
+    required this.inactiveColor,
+    required this.thumbColor,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const trackHeight = 3.0;
+    final centerY = size.height / 2;
+
+    final trackPaint = Paint()..color = inactiveColor;
+    final trackRect = RRect.fromLTRBR(
+      0,
+      centerY - trackHeight / 2,
+      size.width,
+      centerY + trackHeight / 2,
+      const Radius.circular(2),
+    );
+    canvas.drawRRect(trackRect, trackPaint);
+
+    if (!enabled) return;
+
+    final activeWidth = size.width * progress.clamp(0.0, 1.0);
+    final activePaint = Paint()..color = activeColor;
+    final activeRect = RRect.fromLTRBR(
+      0,
+      centerY - trackHeight / 2,
+      activeWidth,
+      centerY + trackHeight / 2,
+      const Radius.circular(2),
+    );
+    canvas.drawRRect(activeRect, activePaint);
+
+    final thumbPaint = Paint()..color = thumbColor;
+    canvas.drawCircle(Offset(activeWidth, centerY), 6, thumbPaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SeekBarPainter oldDelegate) {
+    return oldDelegate.progress != progress || oldDelegate.enabled != enabled;
   }
 }
 
