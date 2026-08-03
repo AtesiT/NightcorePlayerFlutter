@@ -146,9 +146,6 @@ class _RootShellState extends State<RootShell> {
               PlayerScreen(controller: _controller),
               QueueScreen(controller: _controller),
             ];
-            // Fades between the Player and Queue tabs. The key is based on
-            // _selectedIndex only, so repeated controller-driven rebuilds
-            // while staying on the same tab never retrigger the animation.
             return AnimatedSwitcher(
               duration: const Duration(milliseconds: 220),
               transitionBuilder: (child, animation) =>
@@ -191,8 +188,6 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  // Local drag state for the seek bar — purely a UI concern, not part of
-  // the shared controller state. Values are stored in milliseconds.
   bool _isDragging = false;
   Duration? _dragPosition;
   bool _wasPlayingBeforeDrag = false;
@@ -250,8 +245,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final currentTrackName = controller.currentItem?.file.name;
     final hasTrack = currentTrackName != null;
     final displayName = hasTrack ? stripExtension(currentTrackName) : null;
-    // Used to key track-change animations — falls back to -1 when nothing
-    // is loaded so the "No track loaded" state also animates in/out.
     final trackKey = ValueKey(controller.currentTrackId ?? -1);
 
     return Padding(
@@ -261,8 +254,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
         children: [
           const Spacer(flex: 2),
 
-          // Album art placeholder — fades/slides in whenever the active
-          // track changes (including the moment loading begins).
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 300),
             transitionBuilder: _trackChangeTransition,
@@ -295,7 +286,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const Spacer(flex: 1),
 
-          // Track title — same fade/slide treatment as the album art.
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 300),
             transitionBuilder: _trackChangeTransition,
@@ -345,11 +335,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
             },
           ),
 
-          const SizedBox(height: 16),
+          const SizedBox(height: 10),
 
-          // Custom seek bar — drag-only scrubbing (no tap-to-jump), built
-          // with a raw GestureDetector + CustomPainter instead of the
-          // standard Slider, which cannot distinguish a tap from a drag.
+          // Lightweight audio visualizer strip. Purely decorative — driven
+          // by precomputed pseudo-random phases/amplitudes and a single
+          // looping AnimationController, no real audio analysis involved.
+          // Only animates while a track is actually playing; otherwise it
+          // settles into a flat, low resting state.
+          StreamBuilder<PlayerState>(
+            stream: _player.playerStateStream,
+            builder: (context, snapshot) {
+              final playing = snapshot.data?.playing ?? false;
+              final isActive = hasTrack && playing;
+              return _VisualizerStrip(
+                isActive: isActive,
+                color: hasTrack ? AppColors.accentGreen : AppColors.surfaceLight,
+              );
+            },
+          ),
+
+          const SizedBox(height: 10),
+
           StreamBuilder<Duration?>(
             stream: _player.durationStream,
             builder: (context, durationSnapshot) {
@@ -523,8 +529,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   size: 36,
                 ),
               ),
-              // Play/Pause — icon transitions with a simple scale+fade pop
-              // instead of an instant swap.
               StreamBuilder<PlayerState>(
                 stream: _player.playerStateStream,
                 builder: (context, snapshot) {
@@ -575,11 +579,104 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 }
 
+/// A lightweight, programmatic audio visualizer strip. Renders a row of
+/// thin bars whose heights oscillate via phase-shifted sine waves — no
+/// real audio/FFT analysis involved, keeping this purely decorative and
+/// cheap to run continuously. Freezes into a flat resting state whenever
+/// [isActive] is false (paused or no track loaded).
+class _VisualizerStrip extends StatefulWidget {
+  final bool isActive;
+  final Color color;
+
+  const _VisualizerStrip({required this.isActive, required this.color});
+
+  @override
+  State<_VisualizerStrip> createState() => _VisualizerStripState();
+}
+
+class _VisualizerStripState extends State<_VisualizerStrip>
+    with SingleTickerProviderStateMixin {
+  static const int _barCount = 28;
+  static const double _stripHeight = 28;
+
+  late final AnimationController _controller;
+  late final List<double> _phases;
+  late final List<double> _amplitudes;
+
+  @override
+  void initState() {
+    super.initState();
+    // Fixed seed keeps the bar pattern stable across rebuilds (no visual
+    // "reshuffling" every time the widget rebuilds due to parent state).
+    final rand = math.Random(7);
+    _phases = List.generate(_barCount, (_) => rand.nextDouble() * 2 * math.pi);
+    _amplitudes = List.generate(_barCount, (_) => 0.4 + rand.nextDouble() * 0.6);
+
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    );
+
+    if (widget.isActive) {
+      _controller.repeat();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _VisualizerStrip oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive != oldWidget.isActive) {
+      if (widget.isActive) {
+        _controller.repeat();
+      } else {
+        _controller.stop();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: _stripHeight,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, child) {
+          return Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: List.generate(_barCount, (i) {
+              double heightFactor;
+              if (widget.isActive) {
+                final t = _controller.value * 2 * math.pi;
+                final wave = math.sin(t + _phases[i]);
+                heightFactor = 0.15 + _amplitudes[i] * (0.5 + 0.5 * wave);
+              } else {
+                heightFactor = 0.12;
+              }
+              return AnimatedContainer(
+                duration: const Duration(milliseconds: 220),
+                width: 3,
+                height: _stripHeight * heightFactor.clamp(0.08, 1.0),
+                decoration: BoxDecoration(
+                  color: widget.color,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              );
+            }),
+          );
+        },
+      ),
+    );
+  }
+}
+
 /// A custom, drag-only seek bar. Unlike the standard [Slider], a plain tap
-/// will NOT jump the playback position — Flutter's drag gesture recognizer
-/// requires the pointer to move past a small touch-slop threshold before
-/// firing onHorizontalDragStart, which naturally filters out simple taps
-/// while still allowing free scrubbing via drag.
+/// will NOT jump the playback position.
 class _CustomSeekBar extends StatelessWidget {
   final double progress; // 0.0 - 1.0
   final bool enabled;
@@ -635,9 +732,6 @@ class _CustomSeekBar extends StatelessWidget {
   }
 }
 
-/// Paints the seek bar track, filled progress, and thumb. When [enabled]
-/// is false, the whole track renders flat/inactive and no thumb is drawn
-/// — matching a disabled Slider's appearance.
 class _SeekBarPainter extends CustomPainter {
   final double progress;
   final bool enabled;
@@ -738,7 +832,7 @@ class _NightcoreToggleChip extends StatelessWidget {
 }
 
 /// A small animated 3-bar equalizer visual, shown next to the active track
-/// while it's actively playing. Purely decorative/lightweight.
+/// while it's actively playing in the Queue list. Purely decorative.
 class _EqualizerBars extends StatefulWidget {
   final Color color;
 
