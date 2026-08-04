@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 // Supported audio file extensions for the picker.
 const List<String> kSupportedAudioExtensions = [
@@ -28,6 +31,9 @@ const double kSpeedCompareTolerance = 0.001;
 // Maximum time to wait for a track to load before treating it as failed.
 const int kLoadTimeoutSeconds = 15;
 
+// SharedPreferences key under which saved Speed & Pitch presets are stored.
+const String _kPresetsPrefsKey = 'nightcore_speed_pitch_presets';
+
 /// A single entry in the playback queue. Wraps a [PlatformFile] with a
 /// stable [id] (so it can be tracked across reordering/removal) and a
 /// mutable error flag for load-failure feedback.
@@ -43,9 +49,30 @@ class QueueItem {
   });
 }
 
+/// A saved Speed & Pitch preset. Since speed and pitch are always linked in
+/// this app (both set to the same multiplier for the Nightcore-style tape
+/// effect), a single [value] fully describes a preset.
+class SpeedPitchPreset {
+  final int id;
+  final String name;
+  final double value;
+
+  SpeedPitchPreset({
+    required this.id,
+    required this.name,
+    required this.value,
+  });
+
+  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'value': value};
+
+  factory SpeedPitchPreset.fromJson(Map<String, dynamic> json) => SpeedPitchPreset(
+        id: json['id'] as int,
+        name: json['name'] as String,
+        value: (json['value'] as num).toDouble(),
+      );
+}
+
 /// Translates a raised exception into a short, user-friendly message.
-/// Covers the most common failure modes: missing files, unsupported/corrupt
-/// formats, timeouts, missing platform implementations, and generic errors.
 String describeError(Object error) {
   if (error is TimeoutException) {
     return 'Loading timed out. The file may be corrupted, too large, or inaccessible.';
@@ -82,9 +109,9 @@ String describeError(Object error) {
 }
 
 /// Central controller for the NightcorePlayer app. Owns the audio engine,
-/// the playback queue, and all speed/pitch/volume state. Notifies listeners
-/// on every meaningful state change so the UI layer can react via
-/// [ListenableBuilder] without any manual wiring.
+/// the playback queue, speed/pitch/volume state, and saved presets.
+/// Notifies listeners on every meaningful state change so the UI layer can
+/// react via [ListenableBuilder] without any manual wiring.
 ///
 /// Playback errors are surfaced through the [errors] broadcast stream
 /// rather than directly showing UI, keeping this class fully independent
@@ -116,11 +143,19 @@ class PlayerController extends ChangeNotifier {
   double get volume => _volume;
   double _volumeBeforeMute = 1.0;
 
-  // Tracks whether independent pitch-shifting is actually supported by the
-  // current platform/build. Set to false permanently for the session if a
-  // MissingPluginException is ever caught, preventing repeated failed calls.
-  bool _pitchSupported = true;
+  // Only used to avoid spamming the same warning repeatedly. Note: we no
+  // longer permanently disable pitch after a failure — every speed change
+  // still attempts setPitch(), so if the underlying native build gets
+  // fixed (e.g. after a proper clean rebuild), pitch shifting resumes
+  // working automatically without needing any other code changes.
   bool _pitchWarningShown = false;
+
+  // Saved Speed & Pitch presets, persisted via shared_preferences.
+  List<SpeedPitchPreset> _presets = [];
+  List<SpeedPitchPreset> get presets => List.unmodifiable(_presets);
+  int _nextPresetId = 0;
+  bool _presetsLoaded = false;
+  bool get presetsLoaded => _presetsLoaded;
 
   StreamSubscription<PlayerState>? _playerStateSubscription;
 
@@ -149,6 +184,7 @@ class PlayerController extends ChangeNotifier {
         _handleTrackCompleted();
       }
     });
+    _loadPresets();
   }
 
   @override
@@ -165,9 +201,60 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Opens the native file picker allowing multi-selection of audio files,
-  /// appends the results to the queue, and auto-loads the first file if
-  /// the queue was previously empty.
+  Future<void> _loadPresets() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kPresetsPrefsKey);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw) as List<dynamic>;
+        _presets = decoded
+            .map((e) => SpeedPitchPreset.fromJson(e as Map<String, dynamic>))
+            .toList();
+        if (_presets.isNotEmpty) {
+          _nextPresetId = _presets.map((p) => p.id).reduce(math.max) + 1;
+        }
+      }
+    } catch (e) {
+      _emitError('Failed to load saved presets: ${describeError(e)}');
+    } finally {
+      _presetsLoaded = true;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _persistPresets() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = jsonEncode(_presets.map((p) => p.toJson()).toList());
+      await prefs.setString(_kPresetsPrefsKey, raw);
+    } catch (e) {
+      _emitError('Failed to save presets: ${describeError(e)}');
+    }
+  }
+
+  /// Saves the current speed/pitch value as a new named preset. If [name]
+  /// is blank, falls back to a default name based on the numeric value.
+  Future<void> savePreset(String name) async {
+    final trimmed = name.trim();
+    final finalName = trimmed.isEmpty ? '${_speed.toStringAsFixed(2)}x' : trimmed;
+    final preset = SpeedPitchPreset(id: _nextPresetId++, name: finalName, value: _speed);
+    _presets.add(preset);
+    notifyListeners();
+    await _persistPresets();
+  }
+
+  /// Deletes the preset identified by [id].
+  Future<void> deletePreset(int id) async {
+    _presets.removeWhere((p) => p.id == id);
+    notifyListeners();
+    await _persistPresets();
+  }
+
+  /// Applies a saved preset's value as the current speed & pitch.
+  void applyPreset(SpeedPitchPreset preset) {
+    setSpeed(preset.value);
+  }
+
   Future<void> pickAudioFiles() async {
     try {
       final wasQueueEmpty = _queue.isEmpty;
@@ -188,8 +275,6 @@ class PlayerController extends ChangeNotifier {
       notifyListeners();
 
       if (wasQueueEmpty && newItems.isNotEmpty) {
-        // Initial load stays paused — the user hasn't explicitly asked to
-        // play yet, they've just picked files.
         await loadTrackById(newItems.first.id, autoPlay: false);
       }
     } catch (e) {
@@ -197,8 +282,6 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Loads the queue item identified by [id] into the audio engine.
-  /// If [autoPlay] is true, playback starts automatically once loaded.
   Future<void> loadTrackById(int id, {bool autoPlay = false}) async {
     QueueItem? target;
     for (final item in _queue) {
@@ -252,8 +335,6 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Marks [target] as failed, reverts the active selection to whatever
-  /// was loaded before the attempt, and surfaces a descriptive error.
   void _handleLoadFailure({
     required QueueItem target,
     required int? previousTrackId,
@@ -266,10 +347,6 @@ class PlayerController extends ChangeNotifier {
     _emitError('Couldn\'t load "${target.file.name}": $message');
   }
 
-  /// Called whenever the engine reports the current track has finished
-  /// playing naturally. Advances to the next track in the current visual
-  /// queue order, if one exists. If the finished track was the last one
-  /// in the queue, playback simply stops (no looping back to the start).
   Future<void> _handleTrackCompleted() async {
     if (_isHandlingCompletion) return;
     if (_currentTrackId == null) return;
@@ -277,7 +354,6 @@ class PlayerController extends ChangeNotifier {
     final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
     if (currentIndex == -1) return;
 
-    // Last track in the queue — nothing to advance to, playback stops.
     if (currentIndex >= _queue.length - 1) return;
 
     _isHandlingCompletion = true;
@@ -289,9 +365,6 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Skips to the next track in the current visual queue order, wrapping
-  /// around to the first track if currently on the last one. Preserves
-  /// whatever play/pause state was active before the skip.
   Future<void> skipToNext() async {
     if (_queue.isEmpty || _currentTrackId == null) return;
     final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
@@ -302,9 +375,6 @@ class PlayerController extends ChangeNotifier {
     await loadTrackById(_queue[nextIndex].id, autoPlay: wasPlaying);
   }
 
-  /// Skips to the previous track in the current visual queue order,
-  /// wrapping around to the last track if currently on the first one.
-  /// Preserves whatever play/pause state was active before the skip.
   Future<void> skipToPrevious() async {
     if (_queue.isEmpty || _currentTrackId == null) return;
     final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
@@ -315,8 +385,6 @@ class PlayerController extends ChangeNotifier {
     await loadTrackById(_queue[previousIndex].id, autoPlay: wasPlaying);
   }
 
-  /// Removes the queue item with [id]. If it was the currently loaded
-  /// track, playback is stopped and the "current track" is cleared.
   Future<void> removeTrack(int id) async {
     final wasCurrent = _currentTrackId == id;
 
@@ -334,8 +402,6 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Reorders the queue. Since the current track is tracked by id rather
-  /// than index, no extra bookkeeping is needed here.
   void reorderQueue(int oldIndex, int newIndex) {
     if (newIndex > oldIndex) newIndex -= 1;
     final item = _queue.removeAt(oldIndex);
@@ -343,7 +409,6 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Clears the entire queue and stops playback.
   Future<void> clearQueue() async {
     _queue.clear();
     _currentTrackId = null;
@@ -379,34 +444,31 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Applies [value] as the playback speed, and — if supported — also as
-  /// the pitch multiplier, to reproduce the linked Nightcore-style effect.
-  /// If the platform/build doesn't support setPitch (throws
-  /// MissingPluginException), pitch adjustments are disabled for the rest
-  /// of the session and a one-time warning is emitted, while speed changes
-  /// continue to work normally.
+  /// Applies [value] as the playback speed AND the pitch multiplier,
+  /// reproducing the natural "tape/vinyl speed" Nightcore effect where
+  /// speeding up playback raises pitch by the same factor.
+  ///
+  /// setPitch() is retried on every call rather than being permanently
+  /// disabled after a failure — this makes pitch shifting self-healing:
+  /// if the underlying native build gets fixed (e.g. after a proper clean
+  /// iOS rebuild), it will simply start working on the next attempt.
   Future<void> _applySpeedAndPitch(double value) async {
     await player.setSpeed(value);
-
-    if (!_pitchSupported) return;
 
     try {
       await player.setPitch(value);
     } on MissingPluginException {
-      _pitchSupported = false;
       if (!_pitchWarningShown) {
         _pitchWarningShown = true;
         _emitError(
-          'Pitch shifting isn\'t available on this build/platform. '
-          'Speed will still change tempo, but pitch will stay constant.',
+          'Pitch shifting isn\'t available on this build yet. On iOS, try a full '
+          'clean rebuild (pod reinstall + fresh "flutter run") to enable it. '
+          'Speed will still change tempo in the meantime.',
         );
       }
     }
   }
 
-  /// Updates the combined speed & pitch multiplier both in local state and
-  /// on the engine. Both are set to the same value to emulate natural
-  /// tape-speed pitch shifting (the classic Nightcore effect).
   Future<void> setSpeed(double newSpeed) async {
     _speed = newSpeed;
     notifyListeners();
@@ -417,7 +479,6 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Toggles between the Nightcore preset (1.25x) and normal speed (1.0x).
   void toggleNightcoreMode() {
     if (isNightcoreActive) {
       setSpeed(1.0);
@@ -426,7 +487,6 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Updates the volume both in local state and on the engine.
   Future<void> setVolume(double newVolume) async {
     _volume = newVolume;
     notifyListeners();
@@ -437,8 +497,6 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Toggles mute: if currently audible, remembers the volume and sets it
-  /// to 0. If currently muted, restores the remembered volume.
   void toggleMute() {
     if (_volume > 0) {
       _volumeBeforeMute = _volume;

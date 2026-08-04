@@ -55,6 +55,19 @@ Widget _trackChangeTransition(Widget child, Animation<double> animation) {
   );
 }
 
+/// Opens a modal bottom sheet for viewing, applying, saving, and deleting
+/// Speed & Pitch presets.
+Future<void> _openPresetsSheet(BuildContext context, PlayerController controller) {
+  return showModalBottomSheet(
+    context: context,
+    backgroundColor: AppColors.surface,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+    ),
+    builder: (sheetContext) => _PresetsSheet(controller: controller),
+  );
+}
+
 /// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
   const NightcorePlayerApp({super.key});
@@ -97,9 +110,7 @@ class NightcorePlayerApp extends StatelessWidget {
 }
 
 /// The root shell hosting the bottom navigation bar and switching between
-/// the Player tab and the Queue tab. Owns the [PlayerController] instance
-/// (the single source of truth for all playback/queue state) and forwards
-/// its error stream to SnackBars.
+/// the Player tab and the Queue tab. Owns the [PlayerController] instance.
 class RootShell extends StatefulWidget {
   const RootShell({super.key});
 
@@ -337,11 +348,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 10),
 
-          // Lightweight audio visualizer strip. Purely decorative — driven
-          // by precomputed pseudo-random phases/amplitudes and a single
-          // looping AnimationController, no real audio analysis involved.
-          // Only animates while a track is actually playing; otherwise it
-          // settles into a flat, low resting state.
           StreamBuilder<PlayerState>(
             stream: _player.playerStateStream,
             builder: (context, snapshot) {
@@ -437,13 +443,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       ),
                     ),
                   ),
-                  Text(
-                    formatSpeed(controller.speed),
-                    style: const TextStyle(
-                      color: AppColors.accentGreen,
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                    ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        formatSpeed(controller.speed),
+                        style: const TextStyle(
+                          color: AppColors.accentGreen,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      // Opens the Presets sheet (save/apply/delete).
+                      GestureDetector(
+                        onTap: () => _openPresetsSheet(context, controller),
+                        child: const Icon(
+                          Icons.bookmark_border_rounded,
+                          color: AppColors.textSecondary,
+                          size: 20,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -579,11 +600,141 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 }
 
-/// A lightweight, programmatic audio visualizer strip. Renders a row of
-/// thin bars whose heights oscillate via phase-shifted sine waves — no
-/// real audio/FFT analysis involved, keeping this purely decorative and
-/// cheap to run continuously. Freezes into a flat resting state whenever
-/// [isActive] is false (paused or no track loaded).
+/// Modal bottom sheet content listing saved Speed & Pitch presets, with
+/// actions to apply, save a new one, or delete existing ones.
+class _PresetsSheet extends StatelessWidget {
+  final PlayerController controller;
+
+  const _PresetsSheet({required this.controller});
+
+  Future<void> _promptSaveNewPreset(BuildContext context) async {
+    final nameController = TextEditingController();
+    final suggested = formatSpeed(controller.speed);
+
+    final name = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: AppColors.surface,
+          title: const Text('Save Preset', style: TextStyle(color: AppColors.textPrimary)),
+          content: TextField(
+            controller: nameController,
+            autofocus: true,
+            style: const TextStyle(color: AppColors.textPrimary),
+            decoration: InputDecoration(
+              hintText: 'Preset name (e.g. "$suggested")',
+              hintStyle: const TextStyle(color: AppColors.textSecondary),
+              enabledBorder: const UnderlineInputBorder(
+                borderSide: BorderSide(color: AppColors.surfaceLight),
+              ),
+              focusedBorder: const UnderlineInputBorder(
+                borderSide: BorderSide(color: AppColors.accentGreen),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Cancel', style: TextStyle(color: AppColors.textSecondary)),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(nameController.text),
+              child: const Text('Save', style: TextStyle(color: AppColors.accentGreen)),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (name != null) {
+      await controller.savePreset(name);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: ListenableBuilder(
+        listenable: controller,
+        builder: (context, _) {
+          final presets = controller.presets;
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      'Presets',
+                      style: TextStyle(
+                        color: AppColors.textPrimary,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: () => _promptSaveNewPreset(context),
+                      icon: const Icon(Icons.add, color: AppColors.accentGreen, size: 18),
+                      label: const Text('Save Current', style: TextStyle(color: AppColors.accentGreen)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                if (presets.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 24),
+                    child: Center(
+                      child: Text(
+                        'No presets saved yet',
+                        style: TextStyle(color: AppColors.textSecondary),
+                      ),
+                    ),
+                  )
+                else
+                  ConstrainedBox(
+                    constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.4),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: presets.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 4),
+                      itemBuilder: (context, index) {
+                        final preset = presets[index];
+                        final isActive =
+                            (preset.value - controller.speed).abs() < kSpeedCompareTolerance;
+                        return ListTile(
+                          onTap: () => controller.applyPreset(preset),
+                          tileColor: isActive ? AppColors.surfaceLight : null,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                          leading: Icon(
+                            isActive ? Icons.bookmark : Icons.bookmark_border,
+                            color: isActive ? AppColors.accentGreen : AppColors.textSecondary,
+                          ),
+                          title: Text(preset.name, style: const TextStyle(color: AppColors.textPrimary)),
+                          subtitle: Text(
+                            formatSpeed(preset.value),
+                            style: const TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                          ),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.delete_outline, color: AppColors.accentRed, size: 20),
+                            onPressed: () => controller.deletePreset(preset.id),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// A lightweight, programmatic audio visualizer strip.
 class _VisualizerStrip extends StatefulWidget {
   final bool isActive;
   final Color color;
@@ -606,8 +757,6 @@ class _VisualizerStripState extends State<_VisualizerStrip>
   @override
   void initState() {
     super.initState();
-    // Fixed seed keeps the bar pattern stable across rebuilds (no visual
-    // "reshuffling" every time the widget rebuilds due to parent state).
     final rand = math.Random(7);
     _phases = List.generate(_barCount, (_) => rand.nextDouble() * 2 * math.pi);
     _amplitudes = List.generate(_barCount, (_) => 0.4 + rand.nextDouble() * 0.6);
@@ -675,10 +824,9 @@ class _VisualizerStripState extends State<_VisualizerStrip>
   }
 }
 
-/// A custom, drag-only seek bar. Unlike the standard [Slider], a plain tap
-/// will NOT jump the playback position.
+/// A custom, drag-only seek bar.
 class _CustomSeekBar extends StatelessWidget {
-  final double progress; // 0.0 - 1.0
+  final double progress;
   final bool enabled;
   final ValueChanged<double>? onDragStart;
   final ValueChanged<double>? onDragUpdate;
@@ -831,8 +979,7 @@ class _NightcoreToggleChip extends StatelessWidget {
   }
 }
 
-/// A small animated 3-bar equalizer visual, shown next to the active track
-/// while it's actively playing in the Queue list. Purely decorative.
+/// A small animated 3-bar equalizer visual for the active Queue item.
 class _EqualizerBars extends StatefulWidget {
   final Color color;
 

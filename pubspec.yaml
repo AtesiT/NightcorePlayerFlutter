@@ -12,10 +12,9 @@ dependencies:
 
   # Audio playback engine with speed/pitch support
   just_audio: ^0.9.40
-
   # File picking for local audio files
   file_picker: ^8.1.2
-
+  shared_preferences: ^2.3.2
   # Cupertino icons (default Flutter asset, keep for iOS-style icons if needed)
   cupertino_icons: ^1.0.8
 
