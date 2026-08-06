@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:audio_service/audio_service.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -33,6 +34,15 @@ const int kLoadTimeoutSeconds = 15;
 
 // SharedPreferences key under which saved Speed & Pitch presets are stored.
 const String _kPresetsPrefsKey = 'nightcore_speed_pitch_presets';
+
+/// Strips the file extension from a file name for cleaner display.
+/// Shared by both the UI layer and the controller (used when building
+/// MediaItem metadata for the background playback notification).
+String stripExtension(String fileName) {
+  final lastDot = fileName.lastIndexOf('.');
+  if (lastDot <= 0) return fileName;
+  return fileName.substring(0, lastDot);
+}
 
 /// A single entry in the playback queue. Wraps a [PlatformFile] with a
 /// stable [id] (so it can be tracked across reordering/removal) and a
@@ -310,7 +320,19 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await player.setFilePath(path).timeout(
+      // Wrapping the local file in an AudioSource with a MediaItem tag lets
+      // just_audio_background populate the system notification / lock
+      // screen with a title and artist for this track automatically.
+      final audioSource = AudioSource.uri(
+        Uri.file(path),
+        tag: MediaItem(
+          id: target.id.toString(),
+          title: stripExtension(target.file.name),
+          artist: 'NightcorePlayer',
+        ),
+      );
+
+      await player.setAudioSource(audioSource).timeout(
         const Duration(seconds: kLoadTimeoutSeconds),
         onTimeout: () {
           throw TimeoutException(

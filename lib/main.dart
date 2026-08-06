@@ -2,10 +2,24 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 
 import 'player_controller.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Registers the background audio service and system notification channel.
+  // Must be called before any AudioPlayer instance is created, so it runs
+  // before runApp() (and therefore before PlayerController() instantiates
+  // its AudioPlayer inside RootShell's initState).
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.nightcoreplayerflutter.audio',
+    androidNotificationChannelName: 'NightcorePlayer Playback',
+    androidNotificationOngoing: true,
+    androidStopForegroundOnPause: true,
+  );
+
   runApp(const NightcorePlayerApp());
 }
 
@@ -18,13 +32,6 @@ class AppColors {
   static const accentRed = Color(0xFFE57373);
   static const textPrimary = Colors.white;
   static const textSecondary = Color(0xFFB3B3B3);
-}
-
-/// Strips the file extension from a file name for cleaner display.
-String stripExtension(String fileName) {
-  final lastDot = fileName.lastIndexOf('.');
-  if (lastDot <= 0) return fileName;
-  return fileName.substring(0, lastDot);
 }
 
 /// Formats a [Duration] as "m:ss". Returns "--:--" if [duration] is null.
