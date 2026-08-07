@@ -1,26 +1,34 @@
 import 'dart:math' as math;
 
+import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:just_audio_background/just_audio_background.dart';
 
 import 'player_controller.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Registers the background audio service and system notification channel.
-  // Must be called before any AudioPlayer instance is created, so it runs
-  // before runApp() (and therefore before PlayerController() instantiates
-  // its AudioPlayer inside RootShell's initState).
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.nightcoreplayerflutter.audio',
-    androidNotificationChannelName: 'NightcorePlayer Playback',
-    androidNotificationOngoing: true,
-    androidStopForegroundOnPause: true,
+  // Create the shared PlayerController first — the AudioHandler below
+  // wraps its existing AudioPlayer instance and queue logic directly,
+  // rather than owning a separate one.
+  final controller = PlayerController();
+
+  // Registers our custom AudioHandler with the system's audio_service
+  // framework. This routes system notification / lock-screen transport
+  // controls (play, pause, skip, seek, stop) directly into our own
+  // queue-aware PlayerController methods.
+  await AudioService.init(
+    builder: () => NightcoreAudioHandler(controller),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.nightcoreplayerflutter.audio',
+      androidNotificationChannelName: 'NightcorePlayer Playback',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: true,
+    ),
   );
 
-  runApp(const NightcorePlayerApp());
+  runApp(NightcorePlayerApp(controller: controller));
 }
 
 // Spotify-inspired color palette, defined as constants for easy reuse.
@@ -77,7 +85,9 @@ Future<void> _openPresetsSheet(BuildContext context, PlayerController controller
 
 /// Root widget of the NightcorePlayerFlutter application.
 class NightcorePlayerApp extends StatelessWidget {
-  const NightcorePlayerApp({super.key});
+  final PlayerController controller;
+
+  const NightcorePlayerApp({super.key, required this.controller});
 
   @override
   Widget build(BuildContext context) {
@@ -111,15 +121,19 @@ class NightcorePlayerApp extends StatelessWidget {
           type: BottomNavigationBarType.fixed,
         ),
       ),
-      home: const RootShell(),
+      home: RootShell(controller: controller),
     );
   }
 }
 
 /// The root shell hosting the bottom navigation bar and switching between
-/// the Player tab and the Queue tab. Owns the [PlayerController] instance.
+/// the Player tab and the Queue tab. Receives the shared [PlayerController]
+/// instance created in main() (so it can also be wired into the
+/// NightcoreAudioHandler before the widget tree exists).
 class RootShell extends StatefulWidget {
-  const RootShell({super.key});
+  final PlayerController controller;
+
+  const RootShell({super.key, required this.controller});
 
   @override
   State<RootShell> createState() => _RootShellState();
@@ -132,7 +146,7 @@ class _RootShellState extends State<RootShell> {
   @override
   void initState() {
     super.initState();
-    _controller = PlayerController();
+    _controller = widget.controller;
     _controller.errors.listen((message) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

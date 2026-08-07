@@ -12,9 +12,7 @@ dependencies:
 
   # Audio playback engine with speed/pitch support
   just_audio: ^0.9.40
-  # Enables background playback + system media notification
-  just_audio_background: ^0.0.1-beta.13
-  # Required for MediaItem tagging (system notification metadata)
+  # Background playback + system notification / lock-screen media controls
   audio_service: ^0.18.15
   # File picking for local audio files
   file_picker: ^8.1.2

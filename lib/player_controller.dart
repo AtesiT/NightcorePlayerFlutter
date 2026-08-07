@@ -36,8 +36,8 @@ const int kLoadTimeoutSeconds = 15;
 const String _kPresetsPrefsKey = 'nightcore_speed_pitch_presets';
 
 /// Strips the file extension from a file name for cleaner display.
-/// Shared by both the UI layer and the controller (used when building
-/// MediaItem metadata for the background playback notification).
+/// Shared by the UI layer, the controller (MediaItem tagging), and the
+/// audio handler (notification title).
 String stripExtension(String fileName) {
   final lastDot = fileName.lastIndexOf('.');
   if (lastDot <= 0) return fileName;
@@ -321,8 +321,9 @@ class PlayerController extends ChangeNotifier {
 
     try {
       // Wrapping the local file in an AudioSource with a MediaItem tag lets
-      // just_audio_background populate the system notification / lock
-      // screen with a title and artist for this track automatically.
+      // consumers (e.g. our NightcoreAudioHandler) read title/artist info,
+      // though the handler now sources this info directly from the queue
+      // item for consistency with the rest of the UI.
       final audioSource = AudioSource.uri(
         Uri.file(path),
         tag: MediaItem(
@@ -443,16 +444,31 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  Future<void> togglePlayPause() async {
+  /// Starts/resumes playback of the currently loaded track, if any.
+  Future<void> play() async {
     if (_currentTrackId == null) return;
     try {
-      if (player.playing) {
-        await player.pause();
-      } else {
-        await player.play();
-      }
+      await player.play();
     } catch (e) {
       _emitError('Playback error: ${describeError(e)}');
+    }
+  }
+
+  /// Pauses playback of the currently loaded track, if any.
+  Future<void> pause() async {
+    if (_currentTrackId == null) return;
+    try {
+      await player.pause();
+    } catch (e) {
+      _emitError('Playback error: ${describeError(e)}');
+    }
+  }
+
+  Future<void> togglePlayPause() async {
+    if (player.playing) {
+      await pause();
+    } else {
+      await play();
     }
   }
 
@@ -526,5 +542,125 @@ class PlayerController extends ChangeNotifier {
     } else {
       setVolume(_volumeBeforeMute > 0 ? _volumeBeforeMute : 1.0);
     }
+  }
+}
+
+/// Bridges this app's manually-managed playback queue with the OS-level
+/// `audio_service` framework, so that system notification / lock-screen
+/// transport controls (play, pause, skip next/previous, seek, stop) route
+/// directly into [PlayerController]'s own queue-aware logic.
+///
+/// This replaces relying on just_audio's built-in `ConcatenatingAudioSource`
+/// skip handling, which doesn't apply here since tracks are loaded one at a
+/// time via `setAudioSource()` rather than as a single gapless playlist.
+class NightcoreAudioHandler extends BaseAudioHandler with SeekHandler {
+  final PlayerController _controller;
+
+  StreamSubscription<PlayerState>? _playerStateSub;
+  StreamSubscription<Duration>? _positionSub;
+  StreamSubscription<Duration?>? _durationSub;
+
+  NightcoreAudioHandler(this._controller) {
+    _controller.addListener(_syncMediaItem);
+    _durationSub = _controller.player.durationStream.listen((_) => _syncMediaItem());
+    _playerStateSub =
+        _controller.player.playerStateStream.listen((_) => _syncPlaybackState());
+    _positionSub =
+        _controller.player.positionStream.listen((_) => _syncPlaybackState());
+
+    _syncMediaItem();
+    _syncPlaybackState();
+  }
+
+  /// Pushes the current track's title/duration to the system notification
+  /// and lock screen whenever the loaded track or its duration changes.
+  void _syncMediaItem() {
+    final item = _controller.currentItem;
+    if (item == null) {
+      mediaItem.add(null);
+      return;
+    }
+    mediaItem.add(MediaItem(
+      id: item.id.toString(),
+      title: stripExtension(item.file.name),
+      artist: 'NightcorePlayer',
+      duration: _controller.player.duration,
+    ));
+  }
+
+  /// Pushes the current playback status (playing/paused, position, speed,
+  /// available controls) to the system notification and lock screen.
+  void _syncPlaybackState() {
+    final player = _controller.player;
+    final playing = player.playing;
+
+    playbackState.add(playbackState.value.copyWith(
+      controls: [
+        MediaControl.skipToPrevious,
+        playing ? MediaControl.pause : MediaControl.play,
+        MediaControl.stop,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {
+        MediaAction.seek,
+        MediaAction.seekForward,
+        MediaAction.seekBackward,
+      },
+      androidCompactActionIndices: const [0, 1, 3],
+      processingState: _mapProcessingState(player.processingState),
+      playing: playing,
+      updatePosition: player.position,
+      bufferedPosition: player.bufferedPosition,
+      speed: player.speed,
+    ));
+  }
+
+  AudioProcessingState _mapProcessingState(ProcessingState state) {
+    switch (state) {
+      case ProcessingState.idle:
+        return AudioProcessingState.idle;
+      case ProcessingState.loading:
+        return AudioProcessingState.loading;
+      case ProcessingState.buffering:
+        return AudioProcessingState.buffering;
+      case ProcessingState.ready:
+        return AudioProcessingState.ready;
+      case ProcessingState.completed:
+        return AudioProcessingState.completed;
+    }
+  }
+
+  @override
+  Future<void> play() => _controller.play();
+
+  @override
+  Future<void> pause() => _controller.pause();
+
+  @override
+  Future<void> stop() async {
+    await _controller.stopPlayback();
+    playbackState.add(playbackState.value.copyWith(
+      processingState: AudioProcessingState.idle,
+      playing: false,
+    ));
+  }
+
+  @override
+  Future<void> seek(Duration position) => _controller.player.seek(position);
+
+  @override
+  Future<void> skipToNext() => _controller.skipToNext();
+
+  @override
+  Future<void> skipToPrevious() => _controller.skipToPrevious();
+
+  /// Cancels internal stream subscriptions. Not strictly required for the
+  /// background service's lifetime, but provided for symmetry if the
+  /// handler is ever torn down manually.
+  void dispose() {
+    _controller.removeListener(_syncMediaItem);
+    _playerStateSub?.cancel();
+    _positionSub?.cancel();
+    _durationSub?.cancel();
   }
 }
