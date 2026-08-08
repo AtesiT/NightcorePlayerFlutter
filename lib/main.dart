@@ -130,6 +130,11 @@ class NightcorePlayerApp extends StatelessWidget {
 /// the Player tab and the Queue tab. Receives the shared [PlayerController]
 /// instance created in main() (so it can also be wired into the
 /// NightcoreAudioHandler before the widget tree exists).
+///
+/// Note: this ListenableBuilder only listens to PlayerController's own
+/// ChangeNotifier (queue/track/preset changes) — speed and volume changes
+/// are intentionally excluded (see PlayerController's doc comment), so
+/// dragging those sliders never triggers a rebuild here.
 class RootShell extends StatefulWidget {
   final PlayerController controller;
 
@@ -374,9 +379,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
             builder: (context, snapshot) {
               final playing = snapshot.data?.playing ?? false;
               final isActive = hasTrack && playing;
-              return _VisualizerStrip(
-                isActive: isActive,
-                color: hasTrack ? AppColors.accentGreen : AppColors.surfaceLight,
+              // Wrapped in RepaintBoundary: this widget animates
+              // continuously at ~60fps while active, so isolating its
+              // repaint layer prevents that from forcing repaints of
+              // surrounding, otherwise-static UI.
+              return RepaintBoundary(
+                child: _VisualizerStrip(
+                  isActive: isActive,
+                  color: hasTrack ? AppColors.accentGreen : AppColors.surfaceLight,
+                ),
               );
             },
           ),
@@ -404,13 +415,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
                   return Column(
                     children: [
-                      _CustomSeekBar(
-                        progress: progress,
-                        enabled: seekEnabled,
-                        onDragStart: (p) => _onSeekStart(p * maxMs),
-                        onDragUpdate: (p) => _onSeekChanged(p * maxMs),
-                        onDragEnd: () =>
-                            _onSeekEnd(_dragPosition?.inMilliseconds.toDouble() ?? 0),
+                      RepaintBoundary(
+                        child: _CustomSeekBar(
+                          progress: progress,
+                          enabled: seekEnabled,
+                          onDragStart: (p) => _onSeekStart(p * maxMs),
+                          onDragUpdate: (p) => _onSeekChanged(p * maxMs),
+                          onDragEnd: () =>
+                              _onSeekEnd(_dragPosition?.inMilliseconds.toDouble() ?? 0),
+                        ),
                       ),
                       Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 4.0),
@@ -443,113 +456,124 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
           const SizedBox(height: 6),
 
-          Column(
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          // Scoped to controller.speedNotifier only: dragging this slider
+          // rebuilds just this small subtree, not the whole PlayerScreen.
+          ValueListenableBuilder<double>(
+            valueListenable: controller.speedNotifier,
+            builder: (context, speedValue, _) {
+              final isNightcore = (speedValue - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
+              return Column(
                 children: [
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 200),
-                    child: Text(
-                      controller.isNightcoreActive ? '⚡ Nightcore Mode' : 'Speed & Pitch',
-                      key: ValueKey(controller.isNightcoreActive),
-                      style: TextStyle(
-                        color: controller.isNightcoreActive
-                            ? AppColors.accentGreen
-                            : AppColors.textSecondary,
-                        fontSize: 13,
-                        fontWeight: controller.isNightcoreActive
-                            ? FontWeight.w700
-                            : FontWeight.normal,
-                      ),
-                    ),
-                  ),
                   Row(
-                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text(
-                        formatSpeed(controller.speed),
-                        style: const TextStyle(
-                          color: AppColors.accentGreen,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
+                      AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 200),
+                        child: Text(
+                          isNightcore ? '⚡ Nightcore Mode' : 'Speed & Pitch',
+                          key: ValueKey(isNightcore),
+                          style: TextStyle(
+                            color: isNightcore ? AppColors.accentGreen : AppColors.textSecondary,
+                            fontSize: 13,
+                            fontWeight: isNightcore ? FontWeight.w700 : FontWeight.normal,
+                          ),
                         ),
                       ),
-                      const SizedBox(width: 10),
-                      // Opens the Presets sheet (save/apply/delete).
-                      GestureDetector(
-                        onTap: () => _openPresetsSheet(context, controller),
-                        child: const Icon(
-                          Icons.bookmark_border_rounded,
-                          color: AppColors.textSecondary,
-                          size: 20,
-                        ),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            formatSpeed(speedValue),
+                            style: const TextStyle(
+                              color: AppColors.accentGreen,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          // Opens the Presets sheet (save/apply/delete).
+                          GestureDetector(
+                            onTap: () => _openPresetsSheet(context, controller),
+                            child: const Icon(
+                              Icons.bookmark_border_rounded,
+                              color: AppColors.textSecondary,
+                              size: 20,
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
+                  SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      trackHeight: 3,
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                    ),
+                    child: Slider(
+                      value: speedValue,
+                      min: kMinSpeed,
+                      max: kMaxSpeed,
+                      divisions: kSpeedDivisions,
+                      onChanged: controller.setSpeed,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  _NightcoreToggleChip(
+                    isActive: isNightcore,
+                    onTap: controller.toggleNightcoreMode,
+                  ),
                 ],
-              ),
-              SliderTheme(
-                data: SliderTheme.of(context).copyWith(
-                  trackHeight: 3,
-                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                ),
-                child: Slider(
-                  value: controller.speed,
-                  min: kMinSpeed,
-                  max: kMaxSpeed,
-                  divisions: kSpeedDivisions,
-                  onChanged: controller.setSpeed,
-                ),
-              ),
-              const SizedBox(height: 4),
-              _NightcoreToggleChip(
-                isActive: controller.isNightcoreActive,
-                onTap: controller.toggleNightcoreMode,
-              ),
-            ],
+              );
+            },
           ),
 
           const SizedBox(height: 10),
 
-          Row(
-            children: [
-              GestureDetector(
-                onTap: controller.toggleMute,
-                child: Icon(
-                  _volumeIcon(controller.volume),
-                  color: AppColors.textSecondary,
-                  size: 22,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    trackHeight: 3,
-                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+          // Scoped to controller.volumeNotifier only: dragging this
+          // slider rebuilds just this small subtree.
+          ValueListenableBuilder<double>(
+            valueListenable: controller.volumeNotifier,
+            builder: (context, volumeValue, _) {
+              return Row(
+                children: [
+                  GestureDetector(
+                    onTap: controller.toggleMute,
+                    child: Icon(
+                      _volumeIcon(volumeValue),
+                      color: AppColors.textSecondary,
+                      size: 22,
+                    ),
                   ),
-                  child: Slider(
-                    value: controller.volume,
-                    min: 0.0,
-                    max: 1.0,
-                    onChanged: controller.setVolume,
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 3,
+                        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+                      ),
+                      child: Slider(
+                        value: volumeValue,
+                        min: 0.0,
+                        max: 1.0,
+                        onChanged: controller.setVolume,
+                      ),
+                    ),
                   ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              SizedBox(
-                width: 38,
-                child: Text(
-                  formatVolumePercent(controller.volume),
-                  textAlign: TextAlign.right,
-                  style: const TextStyle(
-                    color: AppColors.textSecondary,
-                    fontSize: 12,
+                  const SizedBox(width: 8),
+                  SizedBox(
+                    width: 38,
+                    child: Text(
+                      formatVolumePercent(volumeValue),
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(
+                        color: AppColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
                   ),
-                ),
-              ),
-            ],
+                ],
+              );
+            },
           ),
 
           const SizedBox(height: 8),
@@ -676,7 +700,11 @@ class _PresetsSheet extends StatelessWidget {
   Widget build(BuildContext context) {
     return SafeArea(
       child: ListenableBuilder(
-        listenable: controller,
+        // Merged with speedNotifier so the "active preset" highlight
+        // stays correct if speed changes while this sheet is open (e.g.
+        // applying a preset), without listening to the full controller
+        // for every routine slider drag elsewhere in the app.
+        listenable: Listenable.merge([controller, controller.speedNotifier]),
         builder: (context, _) {
           final presets = controller.presets;
           return Padding(
@@ -1210,8 +1238,14 @@ class QueueScreen extends StatelessWidget {
                                               stream: controller.player.playerStateStream,
                                               builder: (context, snapshot) {
                                                 final playing = snapshot.data?.playing ?? false;
+                                                // Wrapped in RepaintBoundary: continuously
+                                                // animates while playing, isolated so it
+                                                // doesn't force repaints of the whole
+                                                // ListView item / list.
                                                 return playing
-                                                    ? const _EqualizerBars(color: Colors.black)
+                                                    ? const RepaintBoundary(
+                                                        child: _EqualizerBars(color: Colors.black),
+                                                      )
                                                     : const Icon(
                                                         Icons.graphic_eq,
                                                         color: Colors.black,

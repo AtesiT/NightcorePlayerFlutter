@@ -32,6 +32,13 @@ const double kSpeedCompareTolerance = 0.001;
 // Maximum time to wait for a track to load before treating it as failed.
 const int kLoadTimeoutSeconds = 15;
 
+// How often (max) the actual audio engine is updated while a slider is
+// being dragged continuously. The UI thumb itself always tracks the drag
+// instantly via ValueNotifier — this only throttles the underlying
+// native setSpeed/setPitch/setVolume platform-channel calls, preventing
+// call-spam and audible stutter during a fast, continuous drag.
+const Duration kSliderThrottleDuration = Duration(milliseconds: 60);
+
 // SharedPreferences key under which saved Speed & Pitch presets are stored.
 const String _kPresetsPrefsKey = 'nightcore_speed_pitch_presets';
 
@@ -120,8 +127,13 @@ String describeError(Object error) {
 
 /// Central controller for the NightcorePlayer app. Owns the audio engine,
 /// the playback queue, speed/pitch/volume state, and saved presets.
-/// Notifies listeners on every meaningful state change so the UI layer can
-/// react via [ListenableBuilder] without any manual wiring.
+///
+/// Most state changes (queue edits, track loading, presets) are surfaced
+/// via this class's own [ChangeNotifier] / [notifyListeners]. Speed and
+/// volume are a deliberate exception: they're exposed as their own
+/// [ValueNotifier]s (see [speedNotifier] / [volumeNotifier]) so that
+/// high-frequency slider drags only trigger narrowly-scoped UI rebuilds,
+/// not a rebuild of the entire screen on every tick.
 ///
 /// Playback errors are surfaced through the [errors] broadcast stream
 /// rather than directly showing UI, keeping this class fully independent
@@ -146,12 +158,26 @@ class PlayerController extends ChangeNotifier {
   // fires more than once in quick succession.
   bool _isHandlingCompletion = false;
 
-  double _speed = 1.0;
-  double get speed => _speed;
+  /// Isolated from this class's own ChangeNotifier on purpose — see the
+  /// class doc comment. Widgets displaying/editing speed should use a
+  /// [ValueListenableBuilder] on this notifier rather than listening to
+  /// [PlayerController] itself.
+  final ValueNotifier<double> speedNotifier = ValueNotifier<double>(1.0);
+  double get speed => speedNotifier.value;
 
-  double _volume = 1.0;
-  double get volume => _volume;
+  /// Isolated from this class's own ChangeNotifier for the same reason as
+  /// [speedNotifier].
+  final ValueNotifier<double> volumeNotifier = ValueNotifier<double>(1.0);
+  double get volume => volumeNotifier.value;
   double _volumeBeforeMute = 1.0;
+
+  // Throttling state for the native setSpeed/setPitch engine calls.
+  Timer? _speedThrottleTimer;
+  double? _pendingSpeedValue;
+
+  // Throttling state for the native setVolume engine call.
+  Timer? _volumeThrottleTimer;
+  double? _pendingVolumeValue;
 
   // Only used to avoid spamming the same warning repeatedly. Note: we no
   // longer permanently disable pitch after a failure — every speed change
@@ -176,7 +202,7 @@ class PlayerController extends ChangeNotifier {
   Stream<String> get errors => _errorController.stream;
 
   bool get isNightcoreActive =>
-      (_speed - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
+      (speed - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
 
   /// The currently loaded queue item, or null if none / it was removed.
   QueueItem? get currentItem {
@@ -200,6 +226,10 @@ class PlayerController extends ChangeNotifier {
   @override
   void dispose() {
     _playerStateSubscription?.cancel();
+    _speedThrottleTimer?.cancel();
+    _volumeThrottleTimer?.cancel();
+    speedNotifier.dispose();
+    volumeNotifier.dispose();
     player.dispose();
     _errorController.close();
     super.dispose();
@@ -246,8 +276,8 @@ class PlayerController extends ChangeNotifier {
   /// is blank, falls back to a default name based on the numeric value.
   Future<void> savePreset(String name) async {
     final trimmed = name.trim();
-    final finalName = trimmed.isEmpty ? '${_speed.toStringAsFixed(2)}x' : trimmed;
-    final preset = SpeedPitchPreset(id: _nextPresetId++, name: finalName, value: _speed);
+    final finalName = trimmed.isEmpty ? '${speed.toStringAsFixed(2)}x' : trimmed;
+    final preset = SpeedPitchPreset(id: _nextPresetId++, name: finalName, value: speed);
     _presets.add(preset);
     notifyListeners();
     await _persistPresets();
@@ -260,9 +290,12 @@ class PlayerController extends ChangeNotifier {
     await _persistPresets();
   }
 
-  /// Applies a saved preset's value as the current speed & pitch.
+  /// Applies a saved preset's value as the current speed & pitch. Uses
+  /// [immediate] speed application since this is a discrete, one-shot
+  /// action (not a continuous drag), so there's no risk of call-spam and
+  /// snappy feedback matters more than throttling.
   void applyPreset(SpeedPitchPreset preset) {
-    setSpeed(preset.value);
+    setSpeed(preset.value, immediate: true);
   }
 
   Future<void> pickAudioFiles() async {
@@ -341,7 +374,7 @@ class PlayerController extends ChangeNotifier {
           );
         },
       );
-      await _applySpeedAndPitch(_speed);
+      await _applySpeedAndPitch(speed);
 
       if (autoPlay) {
         await player.play();
@@ -507,40 +540,98 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  Future<void> setSpeed(double newSpeed) async {
-    _speed = newSpeed;
-    notifyListeners();
+  Future<void> _commitSpeed(double value) async {
     try {
-      await _applySpeedAndPitch(newSpeed);
+      await _applySpeedAndPitch(value);
     } catch (e) {
       _emitError('Failed to change speed/pitch: ${describeError(e)}');
     }
   }
 
+  /// Updates the playback speed (and, in lockstep, the pitch).
+  ///
+  /// The on-screen slider value updates instantly via [speedNotifier]
+  /// regardless of [immediate] — dragging always feels perfectly smooth.
+  /// What's throttled is the actual native `setSpeed`/`setPitch` platform
+  /// channel calls: while [immediate] is false (the default, used by the
+  /// Slider's onChanged), at most one engine update is sent every
+  /// [kSliderThrottleDuration], always carrying the latest dragged value.
+  ///
+  /// Pass [immediate] = true for discrete, one-shot changes (Nightcore
+  /// toggle, preset selection) where there's no risk of call-spamming and
+  /// snappy feedback matters more than throttling.
+  Future<void> setSpeed(double newSpeed, {bool immediate = false}) async {
+    speedNotifier.value = newSpeed;
+
+    if (immediate) {
+      _speedThrottleTimer?.cancel();
+      _speedThrottleTimer = null;
+      _pendingSpeedValue = null;
+      await _commitSpeed(newSpeed);
+      return;
+    }
+
+    _pendingSpeedValue = newSpeed;
+    _speedThrottleTimer ??= Timer(kSliderThrottleDuration, () {
+      _speedThrottleTimer = null;
+      final valueToApply = _pendingSpeedValue;
+      _pendingSpeedValue = null;
+      if (valueToApply != null) {
+        _commitSpeed(valueToApply);
+      }
+    });
+  }
+
+  /// Toggles between 1.0x (normal) and the Nightcore preset speed. Uses
+  /// [immediate] application since this is a discrete tap, not a drag.
   void toggleNightcoreMode() {
     if (isNightcoreActive) {
-      setSpeed(1.0);
+      setSpeed(1.0, immediate: true);
     } else {
-      setSpeed(kNightcoreSpeed);
+      setSpeed(kNightcoreSpeed, immediate: true);
     }
   }
 
-  Future<void> setVolume(double newVolume) async {
-    _volume = newVolume;
-    notifyListeners();
+  Future<void> _commitVolume(double value) async {
     try {
-      await player.setVolume(newVolume);
+      await player.setVolume(value);
     } catch (e) {
       _emitError('Failed to change volume: ${describeError(e)}');
     }
   }
 
+  /// Updates the playback volume. Same instant-UI / throttled-engine-call
+  /// rationale as [setSpeed] — see its doc comment for details.
+  Future<void> setVolume(double newVolume, {bool immediate = false}) async {
+    volumeNotifier.value = newVolume;
+
+    if (immediate) {
+      _volumeThrottleTimer?.cancel();
+      _volumeThrottleTimer = null;
+      _pendingVolumeValue = null;
+      await _commitVolume(newVolume);
+      return;
+    }
+
+    _pendingVolumeValue = newVolume;
+    _volumeThrottleTimer ??= Timer(kSliderThrottleDuration, () {
+      _volumeThrottleTimer = null;
+      final valueToApply = _pendingVolumeValue;
+      _pendingVolumeValue = null;
+      if (valueToApply != null) {
+        _commitVolume(valueToApply);
+      }
+    });
+  }
+
+  /// Mutes/unmutes. Uses [immediate] application since this is a discrete
+  /// tap, not a drag.
   void toggleMute() {
-    if (_volume > 0) {
-      _volumeBeforeMute = _volume;
-      setVolume(0.0);
+    if (volume > 0) {
+      _volumeBeforeMute = volume;
+      setVolume(0.0, immediate: true);
     } else {
-      setVolume(_volumeBeforeMute > 0 ? _volumeBeforeMute : 1.0);
+      setVolume(_volumeBeforeMute > 0 ? _volumeBeforeMute : 1.0, immediate: true);
     }
   }
 }
