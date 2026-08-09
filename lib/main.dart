@@ -461,7 +461,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ValueListenableBuilder<double>(
             valueListenable: controller.speedNotifier,
             builder: (context, speedValue, _) {
-              final isNightcore = (speedValue - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
+              final isNightcore = speedValuesMatch(speedValue, kNightcoreSpeed);
               return Column(
                 children: [
                   Row(
@@ -751,8 +751,7 @@ class _PresetsSheet extends StatelessWidget {
                       separatorBuilder: (_, __) => const SizedBox(height: 4),
                       itemBuilder: (context, index) {
                         final preset = presets[index];
-                        final isActive =
-                            (preset.value - controller.speed).abs() < kSpeedCompareTolerance;
+                        final isActive = speedValuesMatch(preset.value, controller.speed);
                         return ListTile(
                           onTap: () => controller.applyPreset(preset),
                           tileColor: isActive ? AppColors.surfaceLight : null,

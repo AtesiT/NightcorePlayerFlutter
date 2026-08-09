@@ -25,7 +25,7 @@ final int kSpeedDivisions = ((kMaxSpeed - kMinSpeed) / kSpeedStep).round(); // 3
 const double kNightcoreSpeed = 1.25;
 
 // Tolerance used when comparing floating-point speed values, to safely
-// detect "is the slider at exactly the Nightcore preset" despite potential
+// detect "is the slider at exactly this preset/target" despite potential
 // tiny floating-point drift from division-based slider steps.
 const double kSpeedCompareTolerance = 0.001;
 
@@ -43,13 +43,21 @@ const Duration kSliderThrottleDuration = Duration(milliseconds: 60);
 const String _kPresetsPrefsKey = 'nightcore_speed_pitch_presets';
 
 /// Strips the file extension from a file name for cleaner display.
-/// Shared by the UI layer, the controller (MediaItem tagging), and the
+/// Shared by the UI layer, the controller (error messages), and the
 /// audio handler (notification title).
 String stripExtension(String fileName) {
   final lastDot = fileName.lastIndexOf('.');
   if (lastDot <= 0) return fileName;
   return fileName.substring(0, lastDot);
 }
+
+/// Returns true if [value] matches [target] within [kSpeedCompareTolerance].
+/// Centralizes the floating-point-safe comparison used to detect "is the
+/// current speed exactly at this preset/target value" (e.g. for the
+/// Nightcore Mode indicator and the active-preset highlight), so the same
+/// tolerance logic isn't duplicated across the controller and UI layers.
+bool speedValuesMatch(double value, double target) =>
+    (value - target).abs() < kSpeedCompareTolerance;
 
 /// A single entry in the playback queue. Wraps a [PlatformFile] with a
 /// stable [id] (so it can be tracked across reordering/removal) and a
@@ -89,8 +97,25 @@ class SpeedPitchPreset {
       );
 }
 
+/// Thrown when a queue item's file path cannot be resolved (e.g., missing
+/// path metadata from the file picker result). Kept distinct from
+/// [FileSystemException] so [describeError] can surface an accurate,
+/// specific message rather than the generic "file not found" wording used
+/// for genuine OS-level file errors.
+class InvalidFilePathException implements Exception {
+  final String message;
+  const InvalidFilePathException(this.message);
+
+  @override
+  String toString() => message;
+}
+
 /// Translates a raised exception into a short, user-friendly message.
 String describeError(Object error) {
+  if (error is InvalidFilePathException) {
+    return error.message;
+  }
+
   if (error is TimeoutException) {
     return 'Loading timed out. The file may be corrupted, too large, or inaccessible.';
   }
@@ -201,8 +226,7 @@ class PlayerController extends ChangeNotifier {
   /// listen to this and display each message (e.g., via a SnackBar).
   Stream<String> get errors => _errorController.stream;
 
-  bool get isNightcoreActive =>
-      (speed - kNightcoreSpeed).abs() < kSpeedCompareTolerance;
+  bool get isNightcoreActive => speedValuesMatch(speed, kNightcoreSpeed);
 
   /// The currently loaded queue item, or null if none / it was removed.
   QueueItem? get currentItem {
@@ -325,6 +349,13 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
+  /// Loads the queue item identified by [id] into the audio engine.
+  ///
+  /// Both failure modes — an unresolved file path and any error thrown
+  /// during actual loading/decoding — funnel through a single try/catch/
+  /// finally so the "mark as errored, restore previous track, notify"
+  /// logic exists in exactly one place, with exactly one UI notification
+  /// per attempt.
   Future<void> loadTrackById(int id, {bool autoPlay = false}) async {
     QueueItem? target;
     for (final item in _queue) {
@@ -335,38 +366,21 @@ class PlayerController extends ChangeNotifier {
     }
     if (target == null) return;
 
-    final path = target.file.path;
+    final loadedItem = target;
     final previousTrackId = _currentTrackId;
-
-    if (path == null) {
-      _handleLoadFailure(
-        target: target,
-        previousTrackId: previousTrackId,
-        message: 'Could not resolve a valid file path.',
-      );
-      return;
-    }
 
     _isLoading = true;
     _currentTrackId = id;
-    target.hasError = false;
+    loadedItem.hasError = false;
     notifyListeners();
 
     try {
-      // Wrapping the local file in an AudioSource with a MediaItem tag lets
-      // consumers (e.g. our NightcoreAudioHandler) read title/artist info,
-      // though the handler now sources this info directly from the queue
-      // item for consistency with the rest of the UI.
-      final audioSource = AudioSource.uri(
-        Uri.file(path),
-        tag: MediaItem(
-          id: target.id.toString(),
-          title: stripExtension(target.file.name),
-          artist: 'NightcorePlayer',
-        ),
-      );
+      final path = loadedItem.file.path;
+      if (path == null) {
+        throw const InvalidFilePathException('Could not resolve a valid file path.');
+      }
 
-      await player.setAudioSource(audioSource).timeout(
+      await player.setAudioSource(AudioSource.uri(Uri.file(path))).timeout(
         const Duration(seconds: kLoadTimeoutSeconds),
         onTimeout: () {
           throw TimeoutException(
@@ -380,27 +394,13 @@ class PlayerController extends ChangeNotifier {
         await player.play();
       }
     } catch (e) {
-      _handleLoadFailure(
-        target: target,
-        previousTrackId: previousTrackId,
-        message: describeError(e),
-      );
+      loadedItem.hasError = true;
+      _currentTrackId = previousTrackId;
+      _emitError('Couldn\'t load "${loadedItem.file.name}": ${describeError(e)}');
     } finally {
       _isLoading = false;
       notifyListeners();
     }
-  }
-
-  void _handleLoadFailure({
-    required QueueItem target,
-    required int? previousTrackId,
-    required String message,
-  }) {
-    target.hasError = true;
-    _currentTrackId = previousTrackId;
-    _isLoading = false;
-    notifyListeners();
-    _emitError('Couldn\'t load "${target.file.name}": $message');
   }
 
   Future<void> _handleTrackCompleted() async {
@@ -644,20 +644,23 @@ class PlayerController extends ChangeNotifier {
 /// This replaces relying on just_audio's built-in `ConcatenatingAudioSource`
 /// skip handling, which doesn't apply here since tracks are loaded one at a
 /// time via `setAudioSource()` rather than as a single gapless playlist.
+///
+/// This handler is instantiated exactly once, via `AudioService.init()` in
+/// `main()`, and is intended to live for the entire process lifetime —
+/// matching the standard `audio_service` pattern where the handler backs a
+/// long-running background service rather than a disposable UI widget.
+/// It therefore intentionally does not expose a dispose()/teardown method:
+/// there is no well-defined point in normal app usage where "stop
+/// listening to the player, but keep the process running" would be
+/// correct, and real cleanup happens when the OS reclaims the process.
 class NightcoreAudioHandler extends BaseAudioHandler with SeekHandler {
   final PlayerController _controller;
 
-  StreamSubscription<PlayerState>? _playerStateSub;
-  StreamSubscription<Duration>? _positionSub;
-  StreamSubscription<Duration?>? _durationSub;
-
   NightcoreAudioHandler(this._controller) {
     _controller.addListener(_syncMediaItem);
-    _durationSub = _controller.player.durationStream.listen((_) => _syncMediaItem());
-    _playerStateSub =
-        _controller.player.playerStateStream.listen((_) => _syncPlaybackState());
-    _positionSub =
-        _controller.player.positionStream.listen((_) => _syncPlaybackState());
+    _controller.player.durationStream.listen((_) => _syncMediaItem());
+    _controller.player.playerStateStream.listen((_) => _syncPlaybackState());
+    _controller.player.positionStream.listen((_) => _syncPlaybackState());
 
     _syncMediaItem();
     _syncPlaybackState();
@@ -744,14 +747,4 @@ class NightcoreAudioHandler extends BaseAudioHandler with SeekHandler {
 
   @override
   Future<void> skipToPrevious() => _controller.skipToPrevious();
-
-  /// Cancels internal stream subscriptions. Not strictly required for the
-  /// background service's lifetime, but provided for symmetry if the
-  /// handler is ever torn down manually.
-  void dispose() {
-    _controller.removeListener(_syncMediaItem);
-    _playerStateSub?.cancel();
-    _positionSub?.cancel();
-    _durationSub?.cancel();
-  }
 }
