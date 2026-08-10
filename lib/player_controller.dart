@@ -8,6 +8,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // Supported audio file extensions for the picker.
@@ -38,6 +39,10 @@ const int kLoadTimeoutSeconds = 15;
 // native setSpeed/setPitch/setVolume platform-channel calls, preventing
 // call-spam and audible stutter during a fast, continuous drag.
 const Duration kSliderThrottleDuration = Duration(milliseconds: 60);
+
+// Maximum character length for a saved preset name, to keep it readable
+// in the compact Presets sheet list regardless of user input.
+const int kMaxPresetNameLength = 40;
 
 // SharedPreferences key under which saved Speed & Pitch presets are stored.
 const String _kPresetsPrefsKey = 'nightcore_speed_pitch_presets';
@@ -160,9 +165,10 @@ String describeError(Object error) {
 /// high-frequency slider drags only trigger narrowly-scoped UI rebuilds,
 /// not a rebuild of the entire screen on every tick.
 ///
-/// Playback errors are surfaced through the [errors] broadcast stream
-/// rather than directly showing UI, keeping this class fully independent
-/// of BuildContext/widgets.
+/// Playback errors — and gentle guidance messages for edge-case user
+/// actions, e.g. tapping Play with an empty queue — are surfaced through
+/// the [errors] broadcast stream rather than directly showing UI, keeping
+/// this class fully independent of BuildContext/widgets.
 class PlayerController extends ChangeNotifier {
   final AudioPlayer player = AudioPlayer();
 
@@ -182,6 +188,10 @@ class PlayerController extends ChangeNotifier {
   // Guards against re-entrant auto-advance calls if the completed state
   // fires more than once in quick succession.
   bool _isHandlingCompletion = false;
+
+  // Guards against opening multiple concurrent file picker dialogs if the
+  // user rapidly double-taps "Add Tracks".
+  bool _isPickerOpen = false;
 
   /// Isolated from this class's own ChangeNotifier on purpose — see the
   /// class doc comment. Widgets displaying/editing speed should use a
@@ -211,6 +221,11 @@ class PlayerController extends ChangeNotifier {
   // working automatically without needing any other code changes.
   bool _pitchWarningShown = false;
 
+  // Ensures the notification-permission request/warning only ever fires
+  // once per app session, regardless of how many times
+  // ensureNotificationPermission() is called.
+  bool _notificationPermissionRequested = false;
+
   // Saved Speed & Pitch presets, persisted via shared_preferences.
   List<SpeedPitchPreset> _presets = [];
   List<SpeedPitchPreset> get presets => List.unmodifiable(_presets);
@@ -222,8 +237,10 @@ class PlayerController extends ChangeNotifier {
 
   final StreamController<String> _errorController = StreamController<String>.broadcast();
 
-  /// Broadcast stream of user-facing error messages. The UI layer should
-  /// listen to this and display each message (e.g., via a SnackBar).
+  /// Broadcast stream of user-facing messages — both genuine playback
+  /// errors and gentle guidance for edge-case actions (e.g. an empty
+  /// queue). The UI layer should listen to this and display each message
+  /// (e.g., via a SnackBar).
   Stream<String> get errors => _errorController.stream;
 
   bool get isNightcoreActive => speedValuesMatch(speed, kNightcoreSpeed);
@@ -265,6 +282,65 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
+  /// Returns true if a track is currently loaded and safe to act on.
+  /// Otherwise emits a friendly, context-appropriate guidance message
+  /// (distinguishing "queue is completely empty" from "queue has tracks
+  /// but none is selected") and returns false.
+  ///
+  /// Centralizes this check so Play, Stop, Skip Next, and Skip Previous
+  /// all give the same clear feedback instead of silently doing nothing
+  /// when tapped with no track loaded.
+  bool _ensureTrackAvailable() {
+    if (_currentTrackId != null) return true;
+
+    if (_queue.isEmpty) {
+      _emitError('Your queue is empty. Tap "Add Tracks" to get started.');
+    } else {
+      _emitError('Select a track from the queue to start playing.');
+    }
+    return false;
+  }
+
+  /// Requests the Android 13+ `POST_NOTIFICATIONS` runtime permission,
+  /// needed for the background-playback system notification (and
+  /// therefore the lock-screen transport controls) to actually be visible
+  /// to the user.
+  ///
+  /// This is a no-op on iOS and on web: iOS's lock-screen "Now Playing"
+  /// controls don't depend on local notification permission, and this
+  /// permission concept doesn't apply to web at all.
+  ///
+  /// IMPORTANT: this permission must also be declared in
+  /// AndroidManifest.xml
+  /// (`<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>`)
+  /// for the system permission dialog to appear at all — without that
+  /// manifest entry, `request()` will simply return `denied` silently,
+  /// and this method will surface the "denied" warning below even though
+  /// the user was never actually asked.
+  Future<void> ensureNotificationPermission() async {
+    if (_notificationPermissionRequested) return;
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+
+    _notificationPermissionRequested = true;
+    try {
+      final currentStatus = await Permission.notification.status;
+      if (currentStatus.isGranted) return;
+
+      final result = await Permission.notification.request();
+      if (!result.isGranted) {
+        _emitError(
+          'Notification permission was denied. Background playback still '
+          'works, but lock-screen controls may not be visible. You can '
+          'enable this later in system settings.',
+        );
+      }
+    } catch (e) {
+      // Non-fatal: absence of this permission never blocks core playback,
+      // so a failure here is worth surfacing but not worth retrying.
+      _emitError('Could not request notification permission: ${describeError(e)}');
+    }
+  }
+
   Future<void> _loadPresets() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -298,9 +374,18 @@ class PlayerController extends ChangeNotifier {
 
   /// Saves the current speed/pitch value as a new named preset. If [name]
   /// is blank, falls back to a default name based on the numeric value.
+  /// Names longer than [kMaxPresetNameLength] are truncated — the UI's
+  /// TextField already enforces this limit at input time, but this guard
+  /// keeps the invariant true regardless of caller.
   Future<void> savePreset(String name) async {
-    final trimmed = name.trim();
-    final finalName = trimmed.isEmpty ? '${speed.toStringAsFixed(2)}x' : trimmed;
+    var finalName = name.trim();
+    if (finalName.length > kMaxPresetNameLength) {
+      finalName = finalName.substring(0, kMaxPresetNameLength);
+    }
+    if (finalName.isEmpty) {
+      finalName = '${speed.toStringAsFixed(2)}x';
+    }
+
     final preset = SpeedPitchPreset(id: _nextPresetId++, name: finalName, value: speed);
     _presets.add(preset);
     notifyListeners();
@@ -322,7 +407,14 @@ class PlayerController extends ChangeNotifier {
     setSpeed(preset.value, immediate: true);
   }
 
+  /// Opens the system file picker to add one or more audio files to the
+  /// queue. Guarded against being invoked again while a picker dialog is
+  /// already open (e.g. from a rapid double-tap on "Add Tracks"), which
+  /// would otherwise risk spawning overlapping native dialogs.
   Future<void> pickAudioFiles() async {
+    if (_isPickerOpen) return;
+    _isPickerOpen = true;
+
     try {
       final wasQueueEmpty = _queue.isEmpty;
 
@@ -346,6 +438,8 @@ class PlayerController extends ChangeNotifier {
       }
     } catch (e) {
       _emitError('Failed to open file picker: ${describeError(e)}');
+    } finally {
+      _isPickerOpen = false;
     }
   }
 
@@ -422,7 +516,7 @@ class PlayerController extends ChangeNotifier {
   }
 
   Future<void> skipToNext() async {
-    if (_queue.isEmpty || _currentTrackId == null) return;
+    if (!_ensureTrackAvailable()) return;
     final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
     if (currentIndex == -1) return;
 
@@ -432,7 +526,7 @@ class PlayerController extends ChangeNotifier {
   }
 
   Future<void> skipToPrevious() async {
-    if (_queue.isEmpty || _currentTrackId == null) return;
+    if (!_ensureTrackAvailable()) return;
     final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
     if (currentIndex == -1) return;
 
@@ -477,9 +571,11 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  /// Starts/resumes playback of the currently loaded track, if any.
+  /// Starts/resumes playback of the currently loaded track. If nothing is
+  /// loaded, emits a friendly guidance message instead of silently
+  /// doing nothing (see [_ensureTrackAvailable]).
   Future<void> play() async {
-    if (_currentTrackId == null) return;
+    if (!_ensureTrackAvailable()) return;
     try {
       await player.play();
     } catch (e) {
@@ -505,8 +601,11 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
+  /// Stops playback and resets position to the start. If nothing is
+  /// loaded, emits a friendly guidance message (see
+  /// [_ensureTrackAvailable]).
   Future<void> stopPlayback() async {
-    if (_currentTrackId == null) return;
+    if (!_ensureTrackAvailable()) return;
     try {
       await player.pause();
       await player.seek(Duration.zero);

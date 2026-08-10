@@ -17,6 +17,8 @@ dependencies:
   # File picking for local audio files
   file_picker: ^8.1.2
   shared_preferences: ^2.3.2
+  # Runtime permission requests (e.g. Android 13+ notification permission)
+  permission_handler: ^11.3.1
   # Cupertino icons (default Flutter asset, keep for iOS-style icons if needed)
   cupertino_icons: ^1.0.8
 

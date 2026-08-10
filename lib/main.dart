@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:audio_service/audio_service.dart';
@@ -27,6 +28,13 @@ Future<void> main() async {
       androidStopForegroundOnPause: true,
     ),
   );
+
+  // Fire-and-forget: requests the Android 13+ notification permission
+  // needed for the background-playback notification / lock-screen
+  // controls to be visible. Never blocks app startup, and is a safe
+  // no-op on iOS and older Android versions — see PlayerController for
+  // details.
+  unawaited(controller.ensureNotificationPermission());
 
   runApp(NightcorePlayerApp(controller: controller));
 }
@@ -155,7 +163,18 @@ class _RootShellState extends State<RootShell> {
     _controller.errors.listen((message) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message), duration: const Duration(seconds: 4)),
+        SnackBar(
+          // Long file names embedded in error messages (e.g. "Couldn't
+          // load '<very long name>': ...") are capped at 3 lines with an
+          // ellipsis, so a single message can never balloon the SnackBar
+          // to an awkward height.
+          content: Text(
+            message,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+          duration: const Duration(seconds: 4),
+        ),
       );
     });
   }
@@ -665,8 +684,13 @@ class _PresetsSheet extends StatelessWidget {
           content: TextField(
             controller: nameController,
             autofocus: true,
+            // Caps preset names at the source, so the Presets list never
+            // has to deal with runaway-length input to begin with. The
+            // hidden counter keeps the compact dialog visually clean.
+            maxLength: kMaxPresetNameLength,
             style: const TextStyle(color: AppColors.textPrimary),
             decoration: InputDecoration(
+              counterText: '',
               hintText: 'Preset name (e.g. "$suggested")',
               hintStyle: const TextStyle(color: AppColors.textSecondary),
               enabledBorder: const UnderlineInputBorder(
@@ -760,7 +784,12 @@ class _PresetsSheet extends StatelessWidget {
                             isActive ? Icons.bookmark : Icons.bookmark_border,
                             color: isActive ? AppColors.accentGreen : AppColors.textSecondary,
                           ),
-                          title: Text(preset.name, style: const TextStyle(color: AppColors.textPrimary)),
+                          title: Text(
+                            preset.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: AppColors.textPrimary),
+                          ),
                           subtitle: Text(
                             formatSpeed(preset.value),
                             style: const TextStyle(color: AppColors.textSecondary, fontSize: 12),
