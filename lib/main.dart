@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 
 import 'player_controller.dart';
@@ -48,6 +49,12 @@ class AppColors {
   static const accentRed = Color(0xFFE57373);
   static const textPrimary = Colors.white;
   static const textSecondary = Color(0xFFB3B3B3);
+
+  // Subtle overlay tints used for Material ripple/highlight effects
+  // (FAB, IconButton, ListTile, etc.), kept low-opacity so they read as
+  // a gentle glow rather than a harsh flash against the dark theme.
+  static final splash = accentGreen.withValues(alpha: 0.15);
+  static final highlight = accentGreen.withValues(alpha: 0.08);
 }
 
 /// Formats a [Duration] as "m:ss". Returns "--:--" if [duration] is null.
@@ -78,17 +85,94 @@ Widget _trackChangeTransition(Widget child, Animation<double> animation) {
   );
 }
 
+/// Builds a consistent SnackBar content row (a neutral info icon plus the
+/// message) used across the app's error/guidance notifications.
+///
+/// Note: a neutral icon/color is used intentionally rather than
+/// color-coding by severity (e.g. red for errors, green for success) —
+/// the underlying `errors` stream currently carries plain strings with no
+/// severity metadata, and every message today is actually a warning,
+/// error, or guidance note (there are no genuine "success" confirmations).
+/// Introducing real severity levels would be a clean follow-up
+/// enhancement rather than something to guess at here.
+Widget _snackBarContent(String message) {
+  return Row(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const Icon(Icons.info_outline, color: AppColors.textSecondary, size: 18),
+      const SizedBox(width: 10),
+      Expanded(
+        child: Text(message, maxLines: 3, overflow: TextOverflow.ellipsis),
+      ),
+    ],
+  );
+}
+
 /// Opens a modal bottom sheet for viewing, applying, saving, and deleting
-/// Speed & Pitch presets.
+/// Speed & Pitch presets. Styling (background color, rounded top corners)
+/// comes from the app-wide `BottomSheetThemeData`.
 Future<void> _openPresetsSheet(BuildContext context, PlayerController controller) {
   return showModalBottomSheet(
     context: context,
-    backgroundColor: AppColors.surface,
-    shape: const RoundedRectangleBorder(
-      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-    ),
     builder: (sheetContext) => _PresetsSheet(controller: controller),
   );
+}
+
+/// A lightweight wrapper that gives any child a tactile "press" animation
+/// (a slight scale-down) plus an optional light haptic tick, without
+/// pulling in Material's ink-splash machinery — which would require
+/// wrapping many of our custom-painted / pill-shaped widgets in an extra
+/// `Material` ancestor and carefully matching colors. Used throughout the
+/// transport controls and toggle chips for consistent, snappy tap
+/// feedback that fits the app's minimalist widget tree.
+class _Pressable extends StatefulWidget {
+  final Widget child;
+  final VoidCallback? onTap;
+  final double pressedScale;
+  final bool enableHapticFeedback;
+
+  const _Pressable({
+    required this.child,
+    required this.onTap,
+    this.pressedScale = 0.90,
+    this.enableHapticFeedback = true,
+  });
+
+  @override
+  State<_Pressable> createState() => _PressableState();
+}
+
+class _PressableState extends State<_Pressable> {
+  bool _isPressed = false;
+
+  void _setPressed(bool value) {
+    if (_isPressed == value) return;
+    setState(() => _isPressed = value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final interactive = widget.onTap != null;
+    return GestureDetector(
+      onTapDown: interactive ? (_) => _setPressed(true) : null,
+      onTapUp: interactive ? (_) => _setPressed(false) : null,
+      onTapCancel: interactive ? () => _setPressed(false) : null,
+      onTap: interactive
+          ? () {
+              if (widget.enableHapticFeedback) {
+                HapticFeedback.lightImpact();
+              }
+              widget.onTap!();
+            }
+          : null,
+      child: AnimatedScale(
+        scale: _isPressed ? widget.pressedScale : 1.0,
+        duration: const Duration(milliseconds: 100),
+        curve: Curves.easeOut,
+        child: widget.child,
+      ),
+    );
+  }
 }
 
 /// Root widget of the NightcorePlayerFlutter application.
@@ -105,10 +189,13 @@ class NightcorePlayerApp extends StatelessWidget {
       theme: ThemeData(
         useMaterial3: true,
         scaffoldBackgroundColor: AppColors.background,
+        splashColor: AppColors.splash,
+        highlightColor: AppColors.highlight,
         colorScheme: const ColorScheme.dark(
           primary: AppColors.accentGreen,
           secondary: AppColors.accentGreen,
           surface: AppColors.surface,
+          error: AppColors.accentRed,
         ),
         appBarTheme: const AppBarTheme(
           backgroundColor: AppColors.background,
@@ -127,6 +214,39 @@ class NightcorePlayerApp extends StatelessWidget {
           selectedItemColor: AppColors.accentGreen,
           unselectedItemColor: AppColors.textSecondary,
           type: BottomNavigationBarType.fixed,
+        ),
+        dialogTheme: DialogThemeData(
+          backgroundColor: AppColors.surface,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          titleTextStyle: const TextStyle(
+            color: AppColors.textPrimary,
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+          ),
+          contentTextStyle: const TextStyle(
+            color: AppColors.textSecondary,
+            fontSize: 14,
+          ),
+        ),
+        snackBarTheme: SnackBarThemeData(
+          backgroundColor: AppColors.surface,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          contentTextStyle: const TextStyle(color: AppColors.textPrimary, fontSize: 13),
+          actionTextColor: AppColors.accentGreen,
+        ),
+        bottomSheetTheme: const BottomSheetThemeData(
+          backgroundColor: AppColors.surface,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+          ),
+        ),
+        tooltipTheme: TooltipThemeData(
+          decoration: BoxDecoration(
+            color: AppColors.surfaceLight,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          textStyle: const TextStyle(color: AppColors.textPrimary, fontSize: 12),
         ),
       ),
       home: RootShell(controller: controller),
@@ -164,15 +284,7 @@ class _RootShellState extends State<RootShell> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          // Long file names embedded in error messages (e.g. "Couldn't
-          // load '<very long name>': ...") are capped at 3 lines with an
-          // ellipsis, so a single message can never balloon the SnackBar
-          // to an awkward height.
-          content: Text(
-            message,
-            maxLines: 3,
-            overflow: TextOverflow.ellipsis,
-          ),
+          content: _snackBarContent(message),
           duration: const Duration(seconds: 4),
         ),
       );
@@ -186,6 +298,8 @@ class _RootShellState extends State<RootShell> {
   }
 
   void _onTabTapped(int index) {
+    if (index == _selectedIndex) return;
+    HapticFeedback.selectionClick();
     setState(() {
       _selectedIndex = index;
     });
@@ -277,7 +391,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Seek failed: ${describeError(e)}')),
+          SnackBar(content: _snackBarContent('Seek failed: ${describeError(e)}')),
         );
       }
     }
@@ -511,12 +625,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           ),
                           const SizedBox(width: 10),
                           // Opens the Presets sheet (save/apply/delete).
-                          GestureDetector(
-                            onTap: () => _openPresetsSheet(context, controller),
-                            child: const Icon(
-                              Icons.bookmark_border_rounded,
-                              color: AppColors.textSecondary,
-                              size: 20,
+                          Tooltip(
+                            message: 'Speed & Pitch Presets',
+                            child: _Pressable(
+                              onTap: () => _openPresetsSheet(context, controller),
+                              pressedScale: 0.85,
+                              child: const Icon(
+                                Icons.bookmark_border_rounded,
+                                color: AppColors.textSecondary,
+                                size: 20,
+                              ),
                             ),
                           ),
                         ],
@@ -555,12 +673,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
             builder: (context, volumeValue, _) {
               return Row(
                 children: [
-                  GestureDetector(
-                    onTap: controller.toggleMute,
-                    child: Icon(
-                      _volumeIcon(volumeValue),
-                      color: AppColors.textSecondary,
-                      size: 22,
+                  Tooltip(
+                    message: volumeValue > 0 ? 'Mute' : 'Unmute',
+                    child: _Pressable(
+                      onTap: controller.toggleMute,
+                      pressedScale: 0.85,
+                      child: Icon(
+                        _volumeIcon(volumeValue),
+                        color: AppColors.textSecondary,
+                        size: 22,
+                      ),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -601,59 +723,76 @@ class _PlayerScreenState extends State<PlayerScreen> {
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
               IconButton(
-                onPressed: controller.stopPlayback,
+                onPressed: () {
+                  HapticFeedback.lightImpact();
+                  controller.stopPlayback();
+                },
                 icon: const Icon(Icons.stop_rounded),
                 color: AppColors.textSecondary,
                 iconSize: 26,
+                tooltip: 'Stop',
               ),
-              GestureDetector(
-                onTap: controller.skipToPrevious,
-                child: const Icon(
-                  Icons.skip_previous_rounded,
-                  color: AppColors.textPrimary,
-                  size: 36,
+              Tooltip(
+                message: 'Previous track',
+                child: _Pressable(
+                  onTap: controller.skipToPrevious,
+                  child: const Icon(
+                    Icons.skip_previous_rounded,
+                    color: AppColors.textPrimary,
+                    size: 36,
+                  ),
                 ),
               ),
               StreamBuilder<PlayerState>(
                 stream: _player.playerStateStream,
                 builder: (context, snapshot) {
                   final playing = snapshot.data?.playing ?? false;
-                  return GestureDetector(
-                    onTap: controller.togglePlayPause,
-                    child: Container(
-                      width: 60,
-                      height: 60,
-                      alignment: Alignment.center,
-                      decoration: const BoxDecoration(
-                        color: AppColors.accentGreen,
-                        shape: BoxShape.circle,
-                      ),
-                      child: AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 180),
-                        transitionBuilder: (child, animation) => ScaleTransition(
-                          scale: animation,
-                          child: FadeTransition(opacity: animation, child: child),
+                  return Tooltip(
+                    message: playing ? 'Pause' : 'Play',
+                    child: _Pressable(
+                      onTap: controller.togglePlayPause,
+                      pressedScale: 0.88,
+                      child: Container(
+                        width: 60,
+                        height: 60,
+                        alignment: Alignment.center,
+                        decoration: const BoxDecoration(
+                          color: AppColors.accentGreen,
+                          shape: BoxShape.circle,
                         ),
-                        child: Icon(
-                          playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                          key: ValueKey(playing),
-                          color: Colors.black,
-                          size: 34,
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 180),
+                          transitionBuilder: (child, animation) => ScaleTransition(
+                            scale: animation,
+                            child: FadeTransition(opacity: animation, child: child),
+                          ),
+                          child: Icon(
+                            playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                            key: ValueKey(playing),
+                            color: Colors.black,
+                            size: 34,
+                          ),
                         ),
                       ),
                     ),
                   );
                 },
               ),
-              GestureDetector(
-                onTap: controller.skipToNext,
-                child: const Icon(
-                  Icons.skip_next_rounded,
-                  color: AppColors.textPrimary,
-                  size: 36,
+              Tooltip(
+                message: 'Next track',
+                child: _Pressable(
+                  onTap: controller.skipToNext,
+                  child: const Icon(
+                    Icons.skip_next_rounded,
+                    color: AppColors.textPrimary,
+                    size: 36,
+                  ),
                 ),
               ),
-              const Icon(Icons.repeat, color: AppColors.surfaceLight, size: 24),
+              const Tooltip(
+                message: 'Repeat mode (coming soon)',
+                child: Icon(Icons.repeat, color: AppColors.surfaceLight, size: 24),
+              ),
             ],
           ),
 
@@ -679,8 +818,7 @@ class _PresetsSheet extends StatelessWidget {
       context: context,
       builder: (dialogContext) {
         return AlertDialog(
-          backgroundColor: AppColors.surface,
-          title: const Text('Save Preset', style: TextStyle(color: AppColors.textPrimary)),
+          title: const Text('Save Preset'),
           content: TextField(
             controller: nameController,
             autofocus: true,
@@ -796,6 +934,7 @@ class _PresetsSheet extends StatelessWidget {
                           ),
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline, color: AppColors.accentRed, size: 20),
+                            tooltip: 'Delete preset',
                             onPressed: () => controller.deletePreset(preset.id),
                           ),
                         );
@@ -1022,8 +1161,9 @@ class _NightcoreToggleChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    return _Pressable(
       onTap: onTap,
+      pressedScale: 0.94,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
@@ -1130,14 +1270,9 @@ class QueueScreen extends StatelessWidget {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: const Text(
-          'Clear queue?',
-          style: TextStyle(color: AppColors.textPrimary),
-        ),
+        title: const Text('Clear queue?'),
         content: const Text(
           'This will remove all tracks from the queue and stop playback.',
-          style: TextStyle(color: AppColors.textSecondary),
         ),
         actions: [
           TextButton(
@@ -1185,8 +1320,9 @@ class QueueScreen extends StatelessWidget {
                     ),
                     if (queue.isNotEmpty) ...[
                       const SizedBox(width: 12),
-                      GestureDetector(
+                      _Pressable(
                         onTap: () => _confirmClearAll(context),
+                        pressedScale: 0.92,
                         child: const Text(
                           'Clear All',
                           style: TextStyle(
@@ -1327,7 +1463,10 @@ class QueueScreen extends StatelessWidget {
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: controller.pickAudioFiles,
+        onPressed: () {
+          HapticFeedback.lightImpact();
+          controller.pickAudioFiles();
+        },
         backgroundColor: AppColors.accentGreen,
         foregroundColor: Colors.black,
         icon: const Icon(Icons.add),
