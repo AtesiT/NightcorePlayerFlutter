@@ -8,6 +8,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -46,6 +47,18 @@ const int kMaxPresetNameLength = 40;
 
 // SharedPreferences key under which saved Speed & Pitch presets are stored.
 const String _kPresetsPrefsKey = 'nightcore_speed_pitch_presets';
+
+// SharedPreferences key under which the playback queue (track list) is
+// persisted. Bumped with a version suffix (`_v1`) so that if the stored
+// shape ever changes incompatibly, we can bump this key rather than
+// needing a migration.
+const String _kQueuePrefsKey = 'nightcore_queue_v1';
+
+// Name of the subdirectory (inside the app's Documents directory) where
+// picked audio files are copied for permanent, app-owned storage. See
+// PlayerController's queue persistence doc comment for why this copy
+// step is necessary.
+const String _kAudioLibraryDirName = 'audio_library';
 
 /// Strips the file extension from a file name for cleaner display.
 /// Shared by the UI layer, the controller (error messages), and the
@@ -169,6 +182,23 @@ String describeError(Object error) {
 /// actions, e.g. tapping Play with an empty queue — are surfaced through
 /// the [errors] broadcast stream rather than directly showing UI, keeping
 /// this class fully independent of BuildContext/widgets.
+///
+/// ## Queue persistence
+/// Picked files are copied into an app-owned permanent directory
+/// (`ApplicationDocumentsDirectory/audio_library`) rather than referenced
+/// directly at their picker-provided path — on iOS in particular, the
+/// path returned by the file picker isn't guaranteed to remain valid
+/// across app restarts. The queue's metadata (id, name, path, size) is
+/// then persisted to `shared_preferences` and restored on next launch. If
+/// a previously-queued file is missing at restore time (e.g. deleted
+/// externally, or the initial copy never completed), it's kept in the
+/// queue but flagged via [QueueItem.hasError], reusing the same
+/// error-display UI as a live load failure.
+///
+/// Deliberately out of scope for this pass: the currently-loaded track
+/// and playback position are NOT restored on restart — only the queue's
+/// contents are. Resuming "where you left off" would be a reasonable
+/// follow-up enhancement.
 class PlayerController extends ChangeNotifier {
   final AudioPlayer player = AudioPlayer();
 
@@ -233,6 +263,17 @@ class PlayerController extends ChangeNotifier {
   bool _presetsLoaded = false;
   bool get presetsLoaded => _presetsLoaded;
 
+  // Whether the persisted queue has finished its initial restore attempt
+  // (successful or not). Exposed for parity with [presetsLoaded]; not
+  // currently consumed by the UI, but available for a future loading
+  // indicator if queue restoration ever becomes slow enough to matter.
+  bool _queueLoaded = false;
+  bool get queueLoaded => _queueLoaded;
+
+  // Cached handle to the app's permanent audio storage directory, so we
+  // only resolve/create it once per app session.
+  Directory? _audioLibraryDir;
+
   StreamSubscription<PlayerState>? _playerStateSubscription;
 
   final StreamController<String> _errorController = StreamController<String>.broadcast();
@@ -262,6 +303,7 @@ class PlayerController extends ChangeNotifier {
       }
     });
     _loadPresets();
+    _loadQueue();
   }
 
   @override
@@ -407,10 +449,129 @@ class PlayerController extends ChangeNotifier {
     setSpeed(preset.value, immediate: true);
   }
 
+  /// Returns (creating if necessary) the app-owned permanent directory
+  /// used to store copies of picked audio files. Cached after first
+  /// resolution for the lifetime of this controller.
+  Future<Directory> _getAudioLibraryDir() async {
+    final cached = _audioLibraryDir;
+    if (cached != null) return cached;
+
+    final docsDir = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docsDir.path}/$_kAudioLibraryDirName');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    _audioLibraryDir = dir;
+    return dir;
+  }
+
+  /// Copies the picked file at [sourcePath] into the app's permanent
+  /// audio library directory, naming it by [id] (plus the original
+  /// extension) to guarantee uniqueness regardless of the original file
+  /// name. Returns the resulting [File].
+  Future<File> _copyFileToLibrary(String sourcePath, String originalName, int id) async {
+    final libraryDir = await _getAudioLibraryDir();
+    final lastDot = originalName.lastIndexOf('.');
+    final extension = lastDot > 0 ? originalName.substring(lastDot) : '';
+    final destPath = '${libraryDir.path}/$id$extension';
+    return File(sourcePath).copy(destPath);
+  }
+
+  /// Deletes a previously-copied library file at [path], if it actually
+  /// lives inside our app-owned audio library directory. This guard
+  /// prevents accidentally deleting an original user file in the rare
+  /// fallback case where copying failed and the queue item is still
+  /// pointing directly at the picker-provided path (see
+  /// [_copyFileToLibrary] call sites). Failures are non-fatal — cleanup
+  /// is best-effort.
+  Future<void> _deleteStoredFile(String? path) async {
+    if (path == null) return;
+    try {
+      final libraryDir = await _getAudioLibraryDir();
+      if (!path.startsWith(libraryDir.path)) return;
+
+      final file = File(path);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {
+      // Best-effort cleanup; a stray orphaned file is not worth
+      // surfacing as a user-facing error.
+    }
+  }
+
+  Future<void> _persistQueue() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = jsonEncode(_queue
+          .map((item) => {
+                'id': item.id,
+                'name': item.file.name,
+                'path': item.file.path,
+                'size': item.file.size,
+              })
+          .toList());
+      await prefs.setString(_kQueuePrefsKey, raw);
+    } catch (e) {
+      _emitError('Failed to save queue: ${describeError(e)}');
+    }
+  }
+
+  /// Restores the previously-persisted queue on startup. Each entry's
+  /// file is checked for existence at restore time; if missing, the item
+  /// is still added to the queue (so the user can see it was there and
+  /// remove it) but flagged via [QueueItem.hasError], reusing the same
+  /// "Failed to load — tap to retry" UI as a live load failure.
+  Future<void> _loadQueue() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kQueuePrefsKey);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw) as List<dynamic>;
+        final restored = <QueueItem>[];
+
+        for (final entry in decoded) {
+          final map = entry as Map<String, dynamic>;
+          final id = map['id'] as int;
+          final name = map['name'] as String;
+          final path = map['path'] as String?;
+          final size = (map['size'] as num?)?.toInt() ?? 0;
+          final fileExists = path != null && File(path).existsSync();
+
+          restored.add(QueueItem(
+            id: id,
+            file: PlatformFile(name: name, path: path, size: size),
+            hasError: !fileExists,
+          ));
+        }
+
+        _queue
+          ..clear()
+          ..addAll(restored);
+
+        if (_queue.isNotEmpty) {
+          _nextId = _queue.map((item) => item.id).reduce(math.max) + 1;
+        }
+      }
+    } catch (e) {
+      _emitError('Failed to restore saved queue: ${describeError(e)}');
+    } finally {
+      _queueLoaded = true;
+      notifyListeners();
+    }
+  }
+
   /// Opens the system file picker to add one or more audio files to the
   /// queue. Guarded against being invoked again while a picker dialog is
   /// already open (e.g. from a rapid double-tap on "Add Tracks"), which
   /// would otherwise risk spawning overlapping native dialogs.
+  ///
+  /// Each picked file is copied into the app's permanent audio library
+  /// directory (see [_copyFileToLibrary]) so the queue can be safely
+  /// persisted and survive app restarts. If copying a particular file
+  /// fails, that file falls back to being referenced at its original
+  /// picker-provided path for the current session, with a warning that
+  /// it may not survive a restart.
   Future<void> pickAudioFiles() async {
     if (_isPickerOpen) return;
     _isPickerOpen = true;
@@ -426,12 +587,40 @@ class PlayerController extends ChangeNotifier {
 
       if (result == null || result.files.isEmpty) return;
 
-      final newItems = result.files
-          .map((f) => QueueItem(id: _nextId++, file: f))
-          .toList();
+      final newItems = <QueueItem>[];
+
+      for (final pickedFile in result.files) {
+        final assignedId = _nextId++;
+        final sourcePath = pickedFile.path;
+
+        if (sourcePath == null) {
+          newItems.add(QueueItem(id: assignedId, file: pickedFile, hasError: true));
+          _emitError('Couldn\'t import "${pickedFile.name}": missing file path.');
+          continue;
+        }
+
+        try {
+          final storedFile = await _copyFileToLibrary(sourcePath, pickedFile.name, assignedId);
+          final storedPlatformFile = PlatformFile(
+            name: pickedFile.name,
+            path: storedFile.path,
+            size: await storedFile.length(),
+          );
+          newItems.add(QueueItem(id: assignedId, file: storedPlatformFile));
+        } catch (e) {
+          // Fallback: keep the original picker path so at least this
+          // session can play it, but warn that it may not persist.
+          newItems.add(QueueItem(id: assignedId, file: pickedFile));
+          _emitError(
+            'Couldn\'t copy "${pickedFile.name}" into app storage — it may '
+            'not be available after restarting the app. (${describeError(e)})',
+          );
+        }
+      }
 
       _queue.addAll(newItems);
       notifyListeners();
+      unawaited(_persistQueue());
 
       if (wasQueueEmpty && newItems.isNotEmpty) {
         await loadTrackById(newItems.first.id, autoPlay: false);
@@ -538,6 +727,14 @@ class PlayerController extends ChangeNotifier {
   Future<void> removeTrack(int id) async {
     final wasCurrent = _currentTrackId == id;
 
+    QueueItem? removedItem;
+    for (final item in _queue) {
+      if (item.id == id) {
+        removedItem = item;
+        break;
+      }
+    }
+
     _queue.removeWhere((item) => item.id == id);
 
     if (wasCurrent) {
@@ -550,6 +747,11 @@ class PlayerController extends ChangeNotifier {
       }
     }
     notifyListeners();
+    unawaited(_persistQueue());
+
+    if (removedItem != null) {
+      unawaited(_deleteStoredFile(removedItem.file.path));
+    }
   }
 
   void reorderQueue(int oldIndex, int newIndex) {
@@ -557,9 +759,12 @@ class PlayerController extends ChangeNotifier {
     final item = _queue.removeAt(oldIndex);
     _queue.insert(newIndex, item);
     notifyListeners();
+    unawaited(_persistQueue());
   }
 
   Future<void> clearQueue() async {
+    final removedItems = List<QueueItem>.from(_queue);
+
     _queue.clear();
     _currentTrackId = null;
     notifyListeners();
@@ -568,6 +773,11 @@ class PlayerController extends ChangeNotifier {
       await player.seek(Duration.zero);
     } catch (_) {
       // Nothing meaningful to do if this fails during teardown.
+    }
+    unawaited(_persistQueue());
+
+    for (final item in removedItems) {
+      unawaited(_deleteStoredFile(item.file.path));
     }
   }
 

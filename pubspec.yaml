@@ -10,16 +10,15 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Audio playback engine with speed/pitch support
   just_audio: ^0.9.40
-  # Background playback + system notification / lock-screen media controls
   audio_service: ^0.18.15
-  # File picking for local audio files
   file_picker: ^8.1.2
   shared_preferences: ^2.3.2
-  # Runtime permission requests (e.g. Android 13+ notification permission)
   permission_handler: ^11.3.1
-  # Cupertino icons (default Flutter asset, keep for iOS-style icons if needed)
+  # Persistent, permanent app storage directory for copied audio files
+  # (needed so queue persistence survives across app restarts — see
+  # PlayerController's queue persistence logic).
+  path_provider: ^2.1.4
   cupertino_icons: ^1.0.8
 
 dev_dependencies:
