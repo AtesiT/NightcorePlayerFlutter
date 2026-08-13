@@ -15,10 +15,11 @@ dependencies:
   file_picker: ^8.1.2
   shared_preferences: ^2.3.2
   permission_handler: ^11.3.1
-  # Persistent, permanent app storage directory for copied audio files
-  # (needed so queue persistence survives across app restarts — see
-  # PlayerController's queue persistence logic).
   path_provider: ^2.1.4
+  # Explicit dependency for configuring the audio session category and
+  # reacting to interruptions (calls, other apps, headphone removal) —
+  # see PlayerController's audio session handling.
+  audio_session: ^0.1.21
   cupertino_icons: ^1.0.8
 
 dev_dependencies:

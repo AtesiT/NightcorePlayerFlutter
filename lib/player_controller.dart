@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:audio_service/audio_service.dart';
+import 'package:audio_session/audio_session.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -44,6 +45,13 @@ const Duration kSliderThrottleDuration = Duration(milliseconds: 60);
 // Maximum character length for a saved preset name, to keep it readable
 // in the compact Presets sheet list regardless of user input.
 const int kMaxPresetNameLength = 40;
+
+// Volume multiplier applied directly to the audio engine (bypassing the
+// user's chosen volumeNotifier value) while temporarily "ducking" for a
+// transient, low-priority interruption (e.g. a brief notification sound
+// from another app). Restored back to the user's actual chosen volume
+// once the interruption ends.
+const double kDuckVolumeMultiplier = 0.3;
 
 // SharedPreferences key under which saved Speed & Pitch presets are stored.
 const String _kPresetsPrefsKey = 'nightcore_speed_pitch_presets';
@@ -199,6 +207,23 @@ String describeError(Object error) {
 /// and playback position are NOT restored on restart — only the queue's
 /// contents are. Resuming "where you left off" would be a reasonable
 /// follow-up enhancement.
+///
+/// ## Audio session / interruption handling
+/// On construction, an [AudioSession] is configured with the standard
+/// music-playback category so the OS treats this app as an exclusive
+/// audio player (won't mix with other apps, correctly triggers
+/// interruption/ducking events). Two situations are then handled
+/// automatically, with no UI involvement needed:
+///  - A "hard" interruption (incoming call, another app taking audio
+///    focus) pauses playback, remembering whether we were actually
+///    playing so playback can resume automatically once the interruption
+///    ends — but only if it actually ends (a permanent focus loss, e.g.
+///    the user deliberately starts another music app, correctly does NOT
+///    auto-resume).
+///  - A "soft" interruption (e.g. a brief notification chime) just ducks
+///    the engine volume down temporarily rather than stopping playback.
+///  - Headphones/Bluetooth disconnecting immediately pauses playback, so
+///    audio doesn't suddenly blast from the device's built-in speaker.
 class PlayerController extends ChangeNotifier {
   final AudioPlayer player = AudioPlayer();
 
@@ -274,6 +299,18 @@ class PlayerController extends ChangeNotifier {
   // only resolve/create it once per app session.
   Directory? _audioLibraryDir;
 
+  // --- Audio session / interruption handling state ---
+  StreamSubscription<AudioInterruptionEvent>? _interruptionSubscription;
+  StreamSubscription<void>? _becomingNoisySubscription;
+  // Whether playback was actually active right when a "hard" interruption
+  // (call, another app) began, so we know whether to auto-resume once it
+  // ends. Deliberately NOT the same as "is a track loaded" — we should
+  // never resume a track that was already paused before the interruption.
+  bool _wasPlayingBeforeInterruption = false;
+  // Whether we're currently in a "ducked" (temporarily quieted) state due
+  // to a soft interruption, so we know whether to restore volume on end.
+  bool _isDucking = false;
+
   StreamSubscription<PlayerState>? _playerStateSubscription;
 
   final StreamController<String> _errorController = StreamController<String>.broadcast();
@@ -304,11 +341,14 @@ class PlayerController extends ChangeNotifier {
     });
     _loadPresets();
     _loadQueue();
+    unawaited(_initAudioSession());
   }
 
   @override
   void dispose() {
     _playerStateSubscription?.cancel();
+    _interruptionSubscription?.cancel();
+    _becomingNoisySubscription?.cancel();
     _speedThrottleTimer?.cancel();
     _volumeThrottleTimer?.cancel();
     speedNotifier.dispose();
@@ -321,6 +361,71 @@ class PlayerController extends ChangeNotifier {
   void _emitError(String message) {
     if (!_errorController.isClosed) {
       _errorController.add(message);
+    }
+  }
+
+  /// Configures the OS audio session as a standard exclusive music
+  /// player, and starts listening for interruptions (calls, other apps,
+  /// headphone removal). See the class doc comment for the exact
+  /// behavior. Failure here is non-fatal — core playback still works
+  /// without it, it just won't gracefully react to these OS-level events.
+  Future<void> _initAudioSession() async {
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration.music());
+
+      _interruptionSubscription =
+          session.interruptionEventStream.listen(_handleAudioInterruption);
+      _becomingNoisySubscription =
+          session.becomingNoisyEventStream.listen((_) => _handleBecomingNoisy());
+    } catch (e) {
+      _emitError('Could not configure audio session: ${describeError(e)}');
+    }
+  }
+
+  /// Reacts to an OS-level audio interruption. See the class doc comment
+  /// for the distinction between "hard" (pause) and "soft" (duck)
+  /// interruptions.
+  void _handleAudioInterruption(AudioInterruptionEvent event) {
+    if (event.begin) {
+      switch (event.type) {
+        case AudioInterruptionType.duck:
+          _isDucking = true;
+          player.setVolume(volume * kDuckVolumeMultiplier);
+          break;
+        case AudioInterruptionType.pause:
+        case AudioInterruptionType.unknown:
+          _wasPlayingBeforeInterruption = player.playing;
+          if (player.playing) {
+            player.pause();
+          }
+          break;
+      }
+    } else {
+      switch (event.type) {
+        case AudioInterruptionType.duck:
+          if (_isDucking) {
+            _isDucking = false;
+            player.setVolume(volume);
+          }
+          break;
+        case AudioInterruptionType.pause:
+        case AudioInterruptionType.unknown:
+          if (_wasPlayingBeforeInterruption && _currentTrackId != null) {
+            player.play();
+          }
+          _wasPlayingBeforeInterruption = false;
+          break;
+      }
+    }
+  }
+
+  /// Reacts to the "becoming noisy" system event (headphones or Bluetooth
+  /// disconnected mid-playback) by pausing immediately, matching standard
+  /// platform convention so audio doesn't suddenly play out loud.
+  void _handleBecomingNoisy() {
+    if (player.playing) {
+      player.pause();
     }
   }
 
@@ -911,6 +1016,12 @@ class PlayerController extends ChangeNotifier {
 
   /// Updates the playback volume. Same instant-UI / throttled-engine-call
   /// rationale as [setSpeed] — see its doc comment for details.
+  ///
+  /// Note: if called while a "duck" interruption is active (see the
+  /// class doc comment), this intentionally sets the engine to the exact
+  /// requested value, effectively ending the temporary duck early — this
+  /// is a rare edge case (the user manually dragging the volume slider
+  /// during a brief system sound) and not worth special-casing further.
   Future<void> setVolume(double newVolume, {bool immediate = false}) async {
     volumeNotifier.value = newVolume;
 
