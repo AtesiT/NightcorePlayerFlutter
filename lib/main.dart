@@ -47,6 +47,10 @@ class AppColors {
   static const surfaceLight = Color(0xFF3E3E3E);
   static const accentGreen = Color(0xFF1DB954);
   static const accentRed = Color(0xFFE57373);
+  // Warm amber tone used for non-blocking "warning" notifications —
+  // distinct from accentRed (genuine errors) and textSecondary (plain
+  // info/guidance), fitting the app's dark palette without clashing.
+  static const accentAmber = Color(0xFFFFB74D);
   static const textPrimary = Colors.white;
   static const textSecondary = Color(0xFFB3B3B3);
 
@@ -85,24 +89,31 @@ Widget _trackChangeTransition(Widget child, Animation<double> animation) {
   );
 }
 
-/// Builds a consistent SnackBar content row (a neutral info icon plus the
-/// message) used across the app's error/guidance notifications.
-///
-/// Note: a neutral icon/color is used intentionally rather than
-/// color-coding by severity (e.g. red for errors, green for success) —
-/// the underlying `errors` stream currently carries plain strings with no
-/// severity metadata, and every message today is actually a warning,
-/// error, or guidance note (there are no genuine "success" confirmations).
-/// Introducing real severity levels would be a clean follow-up
-/// enhancement rather than something to guess at here.
-Widget _snackBarContent(String message) {
+/// Maps a [NotificationSeverity] to its SnackBar icon + accent color.
+({IconData icon, Color color}) _severityVisuals(NotificationSeverity severity) {
+  switch (severity) {
+    case NotificationSeverity.error:
+      return (icon: Icons.error_outline, color: AppColors.accentRed);
+    case NotificationSeverity.warning:
+      return (icon: Icons.warning_amber_rounded, color: AppColors.accentAmber);
+    case NotificationSeverity.info:
+      return (icon: Icons.info_outline, color: AppColors.textSecondary);
+  }
+}
+
+/// Builds a consistent SnackBar content row for a [notification]: an
+/// icon and accent color that vary by [NotificationSeverity] (red for
+/// genuine errors, amber for non-blocking warnings, neutral for plain
+/// guidance/info), followed by the message text.
+Widget _snackBarContent(AppNotification notification) {
+  final visuals = _severityVisuals(notification.severity);
   return Row(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
-      const Icon(Icons.info_outline, color: AppColors.textSecondary, size: 18),
+      Icon(visuals.icon, color: visuals.color, size: 18),
       const SizedBox(width: 10),
       Expanded(
-        child: Text(message, maxLines: 3, overflow: TextOverflow.ellipsis),
+        child: Text(notification.message, maxLines: 3, overflow: TextOverflow.ellipsis),
       ),
     ],
   );
@@ -280,11 +291,11 @@ class _RootShellState extends State<RootShell> {
   void initState() {
     super.initState();
     _controller = widget.controller;
-    _controller.errors.listen((message) {
+    _controller.errors.listen((notification) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: _snackBarContent(message),
+          content: _snackBarContent(notification),
           duration: const Duration(seconds: 4),
         ),
       );
@@ -391,7 +402,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: _snackBarContent('Seek failed: ${describeError(e)}')),
+          SnackBar(
+            content: _snackBarContent(
+              AppNotification('Seek failed: ${describeError(e)}', NotificationSeverity.error),
+            ),
+          ),
         );
       }
     }

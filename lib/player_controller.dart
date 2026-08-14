@@ -85,6 +85,23 @@ String stripExtension(String fileName) {
 bool speedValuesMatch(double value, double target) =>
     (value - target).abs() < kSpeedCompareTolerance;
 
+/// Severity level of a user-facing notification emitted via
+/// [PlayerController.errors]. Lets the UI layer render genuine failures,
+/// soft degradations, and plain guidance messages distinctly (e.g.
+/// different SnackBar colors/icons) instead of treating everything the
+/// same way.
+enum NotificationSeverity { error, warning, info }
+
+/// A single user-facing message paired with its [NotificationSeverity].
+/// Emitted via [PlayerController.errors] for the UI layer to display,
+/// typically as a SnackBar.
+class AppNotification {
+  final String message;
+  final NotificationSeverity severity;
+
+  const AppNotification(this.message, this.severity);
+}
+
 /// A single entry in the playback queue. Wraps a [PlatformFile] with a
 /// stable [id] (so it can be tracked across reordering/removal) and a
 /// mutable error flag for load-failure feedback.
@@ -189,7 +206,9 @@ String describeError(Object error) {
 /// Playback errors — and gentle guidance messages for edge-case user
 /// actions, e.g. tapping Play with an empty queue — are surfaced through
 /// the [errors] broadcast stream rather than directly showing UI, keeping
-/// this class fully independent of BuildContext/widgets.
+/// this class fully independent of BuildContext/widgets. Each emitted
+/// [AppNotification] carries a [NotificationSeverity] so the UI can
+/// render genuine errors, soft warnings, and plain guidance distinctly.
 ///
 /// ## Queue persistence
 /// Picked files are copied into an app-owned permanent directory
@@ -313,13 +332,16 @@ class PlayerController extends ChangeNotifier {
 
   StreamSubscription<PlayerState>? _playerStateSubscription;
 
-  final StreamController<String> _errorController = StreamController<String>.broadcast();
+  final StreamController<AppNotification> _errorController =
+      StreamController<AppNotification>.broadcast();
 
-  /// Broadcast stream of user-facing messages — both genuine playback
-  /// errors and gentle guidance for edge-case actions (e.g. an empty
-  /// queue). The UI layer should listen to this and display each message
-  /// (e.g., via a SnackBar).
-  Stream<String> get errors => _errorController.stream;
+  /// Broadcast stream of user-facing notifications — genuine playback
+  /// errors, soft warnings about degraded (but non-blocking) features,
+  /// and gentle guidance for edge-case actions (e.g. an empty queue).
+  /// Each carries a [NotificationSeverity] so the UI layer can render it
+  /// distinctly (e.g. a differently colored/iconed SnackBar) rather than
+  /// treating every message identically.
+  Stream<AppNotification> get errors => _errorController.stream;
 
   bool get isNightcoreActive => speedValuesMatch(speed, kNightcoreSpeed);
 
@@ -358,9 +380,9 @@ class PlayerController extends ChangeNotifier {
     super.dispose();
   }
 
-  void _emitError(String message) {
+  void _emitError(String message, {NotificationSeverity severity = NotificationSeverity.error}) {
     if (!_errorController.isClosed) {
-      _errorController.add(message);
+      _errorController.add(AppNotification(message, severity));
     }
   }
 
@@ -379,7 +401,10 @@ class PlayerController extends ChangeNotifier {
       _becomingNoisySubscription =
           session.becomingNoisyEventStream.listen((_) => _handleBecomingNoisy());
     } catch (e) {
-      _emitError('Could not configure audio session: ${describeError(e)}');
+      _emitError(
+        'Could not configure audio session: ${describeError(e)}',
+        severity: NotificationSeverity.warning,
+      );
     }
   }
 
@@ -441,9 +466,15 @@ class PlayerController extends ChangeNotifier {
     if (_currentTrackId != null) return true;
 
     if (_queue.isEmpty) {
-      _emitError('Your queue is empty. Tap "Add Tracks" to get started.');
+      _emitError(
+        'Your queue is empty. Tap "Add Tracks" to get started.',
+        severity: NotificationSeverity.info,
+      );
     } else {
-      _emitError('Select a track from the queue to start playing.');
+      _emitError(
+        'Select a track from the queue to start playing.',
+        severity: NotificationSeverity.info,
+      );
     }
     return false;
   }
@@ -479,12 +510,16 @@ class PlayerController extends ChangeNotifier {
           'Notification permission was denied. Background playback still '
           'works, but lock-screen controls may not be visible. You can '
           'enable this later in system settings.',
+          severity: NotificationSeverity.warning,
         );
       }
     } catch (e) {
       // Non-fatal: absence of this permission never blocks core playback,
       // so a failure here is worth surfacing but not worth retrying.
-      _emitError('Could not request notification permission: ${describeError(e)}');
+      _emitError(
+        'Could not request notification permission: ${describeError(e)}',
+        severity: NotificationSeverity.warning,
+      );
     }
   }
 
@@ -719,6 +754,7 @@ class PlayerController extends ChangeNotifier {
           _emitError(
             'Couldn\'t copy "${pickedFile.name}" into app storage — it may '
             'not be available after restarting the app. (${describeError(e)})',
+            severity: NotificationSeverity.warning,
           );
         }
       }
@@ -949,6 +985,7 @@ class PlayerController extends ChangeNotifier {
           'Pitch shifting isn\'t available on this build yet. On iOS, try a full '
           'clean rebuild (pod reinstall + fresh "flutter run") to enable it. '
           'Speed will still change tempo in the meantime.',
+          severity: NotificationSeverity.warning,
         );
       }
     }
