@@ -102,6 +102,11 @@ class AppNotification {
   const AppNotification(this.message, this.severity);
 }
 
+/// Repeat behavior applied when the currently-loaded track finishes
+/// playing naturally. See [PlayerController]'s class doc comment
+/// ("Repeat & Shuffle" section) for the exact semantics of each value.
+enum RepeatMode { off, all, one }
+
 /// A single entry in the playback queue. Wraps a [PlatformFile] with a
 /// stable [id] (so it can be tracked across reordering/removal) and a
 /// mutable error flag for load-failure feedback.
@@ -243,6 +248,31 @@ String describeError(Object error) {
 ///    the engine volume down temporarily rather than stopping playback.
 ///  - Headphones/Bluetooth disconnecting immediately pauses playback, so
 ///    audio doesn't suddenly blast from the device's built-in speaker.
+///
+/// ## Repeat & Shuffle
+/// [repeatMode] cycles through Off → All → One via [cycleRepeatMode] (or
+/// can be set directly via [setRepeatMode], used when OS-level transport
+/// controls request a specific mode). It governs what happens when a
+/// track finishes naturally:
+///  - Off: stop after the last track in the current traversal order.
+///  - All: loop back to the start (first queue track in sequential mode,
+///    or a freshly reshuffled order in shuffle mode) once the end is
+///    reached.
+///  - One: replay the exact same track indefinitely, taking priority
+///    over shuffle entirely.
+///
+/// [isShuffleEnabled] (toggled via [toggleShuffle]) replaces the normal
+/// sequential next/previous traversal with a randomly-shuffled order of
+/// the queue. Whenever the shuffle order is (re)generated, the
+/// currently-loaded track is deliberately kept at the current cursor
+/// position, so toggling shuffle on mid-playback never itself skips or
+/// repeats the current track. The order is regenerated whenever the
+/// queue's membership changes (tracks added/removed) while shuffle is
+/// active; purely reordering the queue's manual sequence has no effect
+/// on the shuffle order, since shuffle deliberately ignores manual
+/// ordering. Manually selecting a track from the Queue screen while
+/// shuffle is active correctly re-syncs the shuffle cursor to that
+/// track's position, so subsequent Next/Previous taps stay consistent.
 class PlayerController extends ChangeNotifier {
   final AudioPlayer player = AudioPlayer();
 
@@ -329,6 +359,22 @@ class PlayerController extends ChangeNotifier {
   // Whether we're currently in a "ducked" (temporarily quieted) state due
   // to a soft interruption, so we know whether to restore volume on end.
   bool _isDucking = false;
+
+  // --- Repeat & Shuffle state ---
+  RepeatMode _repeatMode = RepeatMode.off;
+  RepeatMode get repeatMode => _repeatMode;
+
+  bool _isShuffleEnabled = false;
+  bool get isShuffleEnabled => _isShuffleEnabled;
+
+  // Shuffled traversal order (a permutation of queue item ids) used for
+  // Next/Previous/auto-advance while shuffle is active, plus a cursor
+  // pointing at the currently-loaded track's position within it. See the
+  // class doc comment ("Repeat & Shuffle") for how/when this is
+  // regenerated and kept in sync.
+  List<int> _shuffleOrder = [];
+  int _shuffleCursor = -1;
+  final math.Random _shuffleRandom = math.Random();
 
   StreamSubscription<PlayerState>? _playerStateSubscription;
 
@@ -589,6 +635,61 @@ class PlayerController extends ChangeNotifier {
     setSpeed(preset.value, immediate: true);
   }
 
+  /// Cycles [repeatMode] through Off → All → One → Off. Used by the
+  /// transport controls' repeat button (a discrete tap, not a drag).
+  void cycleRepeatMode() {
+    switch (_repeatMode) {
+      case RepeatMode.off:
+        setRepeatMode(RepeatMode.all);
+        break;
+      case RepeatMode.all:
+        setRepeatMode(RepeatMode.one);
+        break;
+      case RepeatMode.one:
+        setRepeatMode(RepeatMode.off);
+        break;
+    }
+  }
+
+  /// Sets [repeatMode] directly to [mode]. Exposed separately from
+  /// [cycleRepeatMode] so OS-level transport controls (which request a
+  /// specific target mode, not "the next one") can set it precisely.
+  void setRepeatMode(RepeatMode mode) {
+    if (_repeatMode == mode) return;
+    _repeatMode = mode;
+    notifyListeners();
+  }
+
+  /// Toggles shuffle traversal on/off. See the class doc comment
+  /// ("Repeat & Shuffle") for exactly how the shuffle order is built and
+  /// maintained.
+  void toggleShuffle() {
+    _isShuffleEnabled = !_isShuffleEnabled;
+    if (_isShuffleEnabled) {
+      _regenerateShuffleOrder(keepCurrentId: _currentTrackId);
+    } else {
+      _shuffleOrder = [];
+      _shuffleCursor = -1;
+    }
+    notifyListeners();
+  }
+
+  /// Rebuilds [_shuffleOrder] as a fresh random permutation of the
+  /// current queue's ids. If [keepCurrentId] is provided and still
+  /// present in the queue, it's moved to the front of the new order and
+  /// [_shuffleCursor] is set to point at it (so the currently-loaded
+  /// track isn't itself skipped/repeated by the regeneration). Otherwise
+  /// the cursor starts at the beginning of the fresh order.
+  void _regenerateShuffleOrder({int? keepCurrentId}) {
+    final ids = _queue.map((item) => item.id).toList();
+    ids.shuffle(_shuffleRandom);
+    if (keepCurrentId != null && ids.remove(keepCurrentId)) {
+      ids.insert(0, keepCurrentId);
+    }
+    _shuffleOrder = ids;
+    _shuffleCursor = ids.isEmpty ? -1 : 0;
+  }
+
   /// Returns (creating if necessary) the app-owned permanent directory
   /// used to store copies of picked audio files. Cached after first
   /// resolution for the lifetime of this controller.
@@ -760,6 +861,9 @@ class PlayerController extends ChangeNotifier {
       }
 
       _queue.addAll(newItems);
+      if (_isShuffleEnabled) {
+        _regenerateShuffleOrder(keepCurrentId: _currentTrackId);
+      }
       notifyListeners();
       unawaited(_persistQueue());
 
@@ -796,6 +900,18 @@ class PlayerController extends ChangeNotifier {
     _isLoading = true;
     _currentTrackId = id;
     loadedItem.hasError = false;
+
+    // Keep the shuffle cursor in sync regardless of how this track came
+    // to be loaded (Next/Previous, auto-advance, OS controls, or a
+    // manual tap on a queue item), so subsequent Next/Previous taps
+    // continue correctly from this track's actual position in the order.
+    if (_isShuffleEnabled) {
+      final shuffleIndex = _shuffleOrder.indexOf(id);
+      if (shuffleIndex != -1) {
+        _shuffleCursor = shuffleIndex;
+      }
+    }
+
     notifyListeners();
 
     try {
@@ -827,19 +943,48 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
+  /// Reacts to the current track finishing playback naturally, driving
+  /// auto-advance according to [repeatMode] and [isShuffleEnabled]. See
+  /// the class doc comment ("Repeat & Shuffle") for the full behavior
+  /// matrix.
   Future<void> _handleTrackCompleted() async {
     if (_isHandlingCompletion) return;
     if (_currentTrackId == null) return;
 
-    final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
-    if (currentIndex == -1) return;
-
-    if (currentIndex >= _queue.length - 1) return;
-
     _isHandlingCompletion = true;
     try {
-      final nextItem = _queue[currentIndex + 1];
-      await loadTrackById(nextItem.id, autoPlay: true);
+      if (_repeatMode == RepeatMode.one) {
+        await player.seek(Duration.zero);
+        await player.play();
+        return;
+      }
+
+      if (_isShuffleEnabled && _shuffleOrder.isNotEmpty) {
+        final atEnd = _shuffleCursor >= _shuffleOrder.length - 1;
+        if (atEnd) {
+          if (_repeatMode == RepeatMode.all) {
+            _regenerateShuffleOrder();
+            if (_shuffleOrder.isNotEmpty) {
+              await loadTrackById(_shuffleOrder[_shuffleCursor], autoPlay: true);
+            }
+          }
+          // RepeatMode.off and shuffle order exhausted: stop here.
+          return;
+        }
+        _shuffleCursor++;
+        await loadTrackById(_shuffleOrder[_shuffleCursor], autoPlay: true);
+        return;
+      }
+
+      final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
+      if (currentIndex == -1) return;
+
+      if (currentIndex < _queue.length - 1) {
+        await loadTrackById(_queue[currentIndex + 1].id, autoPlay: true);
+      } else if (_repeatMode == RepeatMode.all && _queue.isNotEmpty) {
+        await loadTrackById(_queue.first.id, autoPlay: true);
+      }
+      // RepeatMode.off and already on the last track: stop here.
     } finally {
       _isHandlingCompletion = false;
     }
@@ -847,20 +992,34 @@ class PlayerController extends ChangeNotifier {
 
   Future<void> skipToNext() async {
     if (!_ensureTrackAvailable()) return;
+    final wasPlaying = player.playing;
+
+    if (_isShuffleEnabled && _shuffleOrder.isNotEmpty) {
+      _shuffleCursor = (_shuffleCursor + 1) % _shuffleOrder.length;
+      await loadTrackById(_shuffleOrder[_shuffleCursor], autoPlay: wasPlaying);
+      return;
+    }
+
     final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
     if (currentIndex == -1) return;
 
-    final wasPlaying = player.playing;
     final nextIndex = (currentIndex + 1) % _queue.length;
     await loadTrackById(_queue[nextIndex].id, autoPlay: wasPlaying);
   }
 
   Future<void> skipToPrevious() async {
     if (!_ensureTrackAvailable()) return;
+    final wasPlaying = player.playing;
+
+    if (_isShuffleEnabled && _shuffleOrder.isNotEmpty) {
+      _shuffleCursor = (_shuffleCursor - 1 + _shuffleOrder.length) % _shuffleOrder.length;
+      await loadTrackById(_shuffleOrder[_shuffleCursor], autoPlay: wasPlaying);
+      return;
+    }
+
     final currentIndex = _queue.indexWhere((item) => item.id == _currentTrackId);
     if (currentIndex == -1) return;
 
-    final wasPlaying = player.playing;
     final previousIndex = (currentIndex - 1 + _queue.length) % _queue.length;
     await loadTrackById(_queue[previousIndex].id, autoPlay: wasPlaying);
   }
@@ -887,6 +1046,11 @@ class PlayerController extends ChangeNotifier {
         // Nothing meaningful to do if this fails during teardown.
       }
     }
+
+    if (_isShuffleEnabled) {
+      _regenerateShuffleOrder(keepCurrentId: _currentTrackId);
+    }
+
     notifyListeners();
     unawaited(_persistQueue());
 
@@ -899,6 +1063,9 @@ class PlayerController extends ChangeNotifier {
     if (newIndex > oldIndex) newIndex -= 1;
     final item = _queue.removeAt(oldIndex);
     _queue.insert(newIndex, item);
+    // Deliberately NOT regenerating the shuffle order here: shuffle
+    // traversal intentionally ignores the queue's manual ordering, so a
+    // pure reorder (no membership change) has no effect on it.
     notifyListeners();
     unawaited(_persistQueue());
   }
@@ -908,6 +1075,8 @@ class PlayerController extends ChangeNotifier {
 
     _queue.clear();
     _currentTrackId = null;
+    _shuffleOrder = [];
+    _shuffleCursor = -1;
     notifyListeners();
     try {
       await player.pause();
@@ -1095,8 +1264,9 @@ class PlayerController extends ChangeNotifier {
 
 /// Bridges this app's manually-managed playback queue with the OS-level
 /// `audio_service` framework, so that system notification / lock-screen
-/// transport controls (play, pause, skip next/previous, seek, stop) route
-/// directly into [PlayerController]'s own queue-aware logic.
+/// transport controls (play, pause, skip next/previous, seek, stop,
+/// repeat, shuffle) route directly into [PlayerController]'s own
+/// queue-aware logic.
 ///
 /// This replaces relying on just_audio's built-in `ConcatenatingAudioSource`
 /// skip handling, which doesn't apply here since tracks are loaded one at a
@@ -1115,6 +1285,7 @@ class NightcoreAudioHandler extends BaseAudioHandler with SeekHandler {
 
   NightcoreAudioHandler(this._controller) {
     _controller.addListener(_syncMediaItem);
+    _controller.addListener(_syncPlaybackState);
     _controller.player.durationStream.listen((_) => _syncMediaItem());
     _controller.player.playerStateStream.listen((_) => _syncPlaybackState());
     _controller.player.positionStream.listen((_) => _syncPlaybackState());
@@ -1140,7 +1311,8 @@ class NightcoreAudioHandler extends BaseAudioHandler with SeekHandler {
   }
 
   /// Pushes the current playback status (playing/paused, position, speed,
-  /// available controls) to the system notification and lock screen.
+  /// repeat/shuffle mode, available controls) to the system notification
+  /// and lock screen.
   void _syncPlaybackState() {
     final player = _controller.player;
     final playing = player.playing;
@@ -1163,6 +1335,8 @@ class NightcoreAudioHandler extends BaseAudioHandler with SeekHandler {
       updatePosition: player.position,
       bufferedPosition: player.bufferedPosition,
       speed: player.speed,
+      repeatMode: _mapRepeatMode(_controller.repeatMode),
+      shuffleMode: _mapShuffleMode(_controller.isShuffleEnabled),
     ));
   }
 
@@ -1180,6 +1354,20 @@ class NightcoreAudioHandler extends BaseAudioHandler with SeekHandler {
         return AudioProcessingState.completed;
     }
   }
+
+  AudioServiceRepeatMode _mapRepeatMode(RepeatMode mode) {
+    switch (mode) {
+      case RepeatMode.off:
+        return AudioServiceRepeatMode.none;
+      case RepeatMode.all:
+        return AudioServiceRepeatMode.all;
+      case RepeatMode.one:
+        return AudioServiceRepeatMode.one;
+    }
+  }
+
+  AudioServiceShuffleMode _mapShuffleMode(bool enabled) =>
+      enabled ? AudioServiceShuffleMode.all : AudioServiceShuffleMode.none;
 
   @override
   Future<void> play() => _controller.play();
@@ -1204,4 +1392,30 @@ class NightcoreAudioHandler extends BaseAudioHandler with SeekHandler {
 
   @override
   Future<void> skipToPrevious() => _controller.skipToPrevious();
+
+  @override
+  Future<void> setRepeatMode(AudioServiceRepeatMode repeatMode) async {
+    final RepeatMode mode;
+    switch (repeatMode) {
+      case AudioServiceRepeatMode.one:
+        mode = RepeatMode.one;
+        break;
+      case AudioServiceRepeatMode.all:
+      case AudioServiceRepeatMode.group:
+        mode = RepeatMode.all;
+        break;
+      case AudioServiceRepeatMode.none:
+        mode = RepeatMode.off;
+        break;
+    }
+    _controller.setRepeatMode(mode);
+  }
+
+  @override
+  Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) async {
+    final enabled = shuffleMode != AudioServiceShuffleMode.none;
+    if (enabled != _controller.isShuffleEnabled) {
+      _controller.toggleShuffle();
+    }
+  }
 }

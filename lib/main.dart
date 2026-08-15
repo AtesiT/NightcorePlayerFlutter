@@ -18,8 +18,8 @@ Future<void> main() async {
 
   // Registers our custom AudioHandler with the system's audio_service
   // framework. This routes system notification / lock-screen transport
-  // controls (play, pause, skip, seek, stop) directly into our own
-  // queue-aware PlayerController methods.
+  // controls (play, pause, skip, seek, stop, repeat, shuffle) directly
+  // into our own queue-aware PlayerController methods.
   await AudioService.init(
     builder: () => NightcoreAudioHandler(controller),
     config: const AudioServiceConfig(
@@ -75,6 +75,18 @@ String formatSpeed(double speed) => '${speed.toStringAsFixed(2)}x';
 
 /// Formats a 0.0–1.0 volume level as a percentage string, e.g. "100%".
 String formatVolumePercent(double volume) => '${(volume * 100).round()}%';
+
+/// Returns a short tooltip label describing the current [RepeatMode].
+String repeatModeTooltip(RepeatMode mode) {
+  switch (mode) {
+    case RepeatMode.off:
+      return 'Repeat: Off';
+    case RepeatMode.all:
+      return 'Repeat: All';
+    case RepeatMode.one:
+      return 'Repeat: One';
+  }
+}
 
 /// Shared transition used for track-change animations (album art, title):
 /// a gentle fade combined with a small upward slide.
@@ -271,9 +283,9 @@ class NightcorePlayerApp extends StatelessWidget {
 /// NightcoreAudioHandler before the widget tree exists).
 ///
 /// Note: this ListenableBuilder only listens to PlayerController's own
-/// ChangeNotifier (queue/track/preset changes) — speed and volume changes
-/// are intentionally excluded (see PlayerController's doc comment), so
-/// dragging those sliders never triggers a rebuild here.
+/// ChangeNotifier (queue/track/preset/repeat/shuffle changes) — speed and
+/// volume changes are intentionally excluded (see PlayerController's doc
+/// comment), so dragging those sliders never triggers a rebuild here.
 class RootShell extends StatefulWidget {
   final PlayerController controller;
 
@@ -737,6 +749,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
+              Tooltip(
+                message: controller.isShuffleEnabled ? 'Shuffle: On' : 'Shuffle: Off',
+                child: _Pressable(
+                  onTap: controller.toggleShuffle,
+                  pressedScale: 0.85,
+                  child: Icon(
+                    Icons.shuffle_rounded,
+                    color: controller.isShuffleEnabled
+                        ? AppColors.accentGreen
+                        : AppColors.textSecondary,
+                    size: 22,
+                  ),
+                ),
+              ),
               IconButton(
                 onPressed: () {
                   HapticFeedback.lightImpact();
@@ -804,9 +830,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   ),
                 ),
               ),
-              const Tooltip(
-                message: 'Repeat mode (coming soon)',
-                child: Icon(Icons.repeat, color: AppColors.surfaceLight, size: 24),
+              Tooltip(
+                message: repeatModeTooltip(controller.repeatMode),
+                child: _Pressable(
+                  onTap: controller.cycleRepeatMode,
+                  pressedScale: 0.85,
+                  child: Icon(
+                    controller.repeatMode == RepeatMode.one
+                        ? Icons.repeat_one_rounded
+                        : Icons.repeat_rounded,
+                    color: controller.repeatMode == RepeatMode.off
+                        ? AppColors.textSecondary
+                        : AppColors.accentGreen,
+                    size: 24,
+                  ),
+                ),
               ),
             ],
           ),
