@@ -5,11 +5,22 @@ import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:metadata_god/metadata_god.dart';
 
 import 'player_controller.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Initializes the metadata_god native bindings used for extracting
+  // embedded album artwork from audio files. Non-fatal if unavailable on
+  // a given platform/build — album art simply won't be found, and
+  // playback itself is entirely unaffected.
+  try {
+    MetadataGod.initialize();
+  } catch (_) {
+    // See above: purely cosmetic feature, safe to ignore failures here.
+  }
 
   // Create the shared PlayerController first — the AudioHandler below
   // wraps its existing AudioPlayer instance and queue logic directly,
@@ -283,9 +294,10 @@ class NightcorePlayerApp extends StatelessWidget {
 /// NightcoreAudioHandler before the widget tree exists).
 ///
 /// Note: this ListenableBuilder only listens to PlayerController's own
-/// ChangeNotifier (queue/track/preset/repeat/shuffle changes) — speed and
-/// volume changes are intentionally excluded (see PlayerController's doc
-/// comment), so dragging those sliders never triggers a rebuild here.
+/// ChangeNotifier (queue/track/preset/repeat/shuffle/album-art changes) —
+/// speed and volume changes are intentionally excluded (see
+/// PlayerController's doc comment), so dragging those sliders never
+/// triggers a rebuild here.
 class RootShell extends StatefulWidget {
   final PlayerController controller;
 
@@ -443,6 +455,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final hasTrack = currentTrackName != null;
     final displayName = hasTrack ? stripExtension(currentTrackName) : null;
     final trackKey = ValueKey(controller.currentTrackId ?? -1);
+    final albumArt = controller.currentItem?.albumArt;
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -469,15 +482,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   ),
                 ],
               ),
-              child: Center(
-                child: controller.isLoading
-                    ? const CircularProgressIndicator(color: AppColors.accentGreen)
-                    : const Icon(
-                        Icons.music_note_rounded,
-                        size: 90,
-                        color: AppColors.textSecondary,
-                      ),
-              ),
+              child: controller.isLoading
+                  ? const Center(
+                      child: CircularProgressIndicator(color: AppColors.accentGreen),
+                    )
+                  : (albumArt != null
+                      ? ClipRRect(
+                          borderRadius: BorderRadius.circular(16),
+                          child: Image.memory(
+                            albumArt,
+                            width: 220,
+                            height: 220,
+                            fit: BoxFit.cover,
+                            // Falls back gracefully if the embedded
+                            // artwork bytes turn out to be corrupt or
+                            // undecodable, rather than crashing the
+                            // whole track display.
+                            errorBuilder: (context, error, stackTrace) => const Icon(
+                              Icons.music_note_rounded,
+                              size: 90,
+                              color: AppColors.textSecondary,
+                            ),
+                          ),
+                        )
+                      : const Center(
+                          child: Icon(
+                            Icons.music_note_rounded,
+                            size: 90,
+                            color: AppColors.textSecondary,
+                          ),
+                        )),
             ),
           ),
 
@@ -1345,6 +1379,72 @@ class QueueScreen extends StatelessWidget {
     }
   }
 
+  /// Builds the leading avatar for a queue row: embedded album art when
+  /// available (with a small translucent status overlay for the active
+  /// track's loading/error/equalizer indicator, kept legible against
+  /// arbitrary artwork colors), falling back to the original flat-color
+  /// icon avatar when no artwork was found for this track.
+  Widget _buildLeadingAvatar({
+    required QueueItem item,
+    required bool isActive,
+    required bool isActiveLoading,
+    required bool hasError,
+  }) {
+    final art = item.albumArt;
+    final hasArt = !hasError && art != null;
+
+    Widget? overlay;
+    if (isActiveLoading) {
+      overlay = const SizedBox(
+        width: 16,
+        height: 16,
+        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black),
+      );
+    } else if (hasError) {
+      overlay = const Icon(Icons.error_outline, color: AppColors.accentRed, size: 20);
+    } else if (isActive) {
+      overlay = StreamBuilder<PlayerState>(
+        stream: controller.player.playerStateStream,
+        builder: (context, snapshot) {
+          final playing = snapshot.data?.playing ?? false;
+          final iconColor = hasArt ? Colors.white : Colors.black;
+          // Wrapped in RepaintBoundary: continuously animates while
+          // playing, isolated so it doesn't force repaints of the whole
+          // ListView item / list.
+          return playing
+              ? RepaintBoundary(child: _EqualizerBars(color: iconColor))
+              : Icon(Icons.graphic_eq, color: iconColor, size: 20);
+        },
+      );
+    } else if (!hasArt) {
+      overlay = const Icon(Icons.music_note, color: AppColors.textSecondary, size: 20);
+    }
+
+    // Give the overlay a small translucent backdrop when drawn on top of
+    // artwork, so it stays legible regardless of the artwork's own colors.
+    if (hasArt && overlay != null) {
+      overlay = Container(
+        width: 24,
+        height: 24,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.45),
+          shape: BoxShape.circle,
+        ),
+        child: overlay,
+      );
+    }
+
+    return CircleAvatar(
+      backgroundColor: hasError
+          ? AppColors.accentRed.withValues(alpha: 0.15)
+          : (isActive ? AppColors.accentGreen : AppColors.surface),
+      backgroundImage: hasArt ? MemoryImage(art) : null,
+      onBackgroundImageError: hasArt ? (_, __) {} : null,
+      child: overlay,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final queue = controller.queue;
@@ -1431,50 +1531,11 @@ class QueueScreen extends StatelessWidget {
                                   ? const BorderSide(color: AppColors.accentRed, width: 1)
                                   : BorderSide.none,
                             ),
-                            leading: CircleAvatar(
-                              backgroundColor: hasError
-                                  ? AppColors.accentRed.withValues(alpha: 0.15)
-                                  : (isActive ? AppColors.accentGreen : AppColors.surface),
-                              child: isActiveLoading
-                                  ? const SizedBox(
-                                      width: 16,
-                                      height: 16,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        color: Colors.black,
-                                      ),
-                                    )
-                                  : hasError
-                                      ? const Icon(
-                                          Icons.error_outline,
-                                          color: AppColors.accentRed,
-                                          size: 20,
-                                        )
-                                      : isActive
-                                          ? StreamBuilder<PlayerState>(
-                                              stream: controller.player.playerStateStream,
-                                              builder: (context, snapshot) {
-                                                final playing = snapshot.data?.playing ?? false;
-                                                // Wrapped in RepaintBoundary: continuously
-                                                // animates while playing, isolated so it
-                                                // doesn't force repaints of the whole
-                                                // ListView item / list.
-                                                return playing
-                                                    ? const RepaintBoundary(
-                                                        child: _EqualizerBars(color: Colors.black),
-                                                      )
-                                                    : const Icon(
-                                                        Icons.graphic_eq,
-                                                        color: Colors.black,
-                                                        size: 20,
-                                                      );
-                                              },
-                                            )
-                                          : const Icon(
-                                              Icons.music_note,
-                                              color: AppColors.textSecondary,
-                                              size: 20,
-                                            ),
+                            leading: _buildLeadingAvatar(
+                              item: item,
+                              isActive: isActive,
+                              isActiveLoading: isActiveLoading,
+                              hasError: hasError,
                             ),
                             title: Text(
                               stripExtension(item.file.name),

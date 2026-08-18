@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
@@ -9,6 +10,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:metadata_god/metadata_god.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -108,12 +110,27 @@ class AppNotification {
 enum RepeatMode { off, all, one }
 
 /// A single entry in the playback queue. Wraps a [PlatformFile] with a
-/// stable [id] (so it can be tracked across reordering/removal) and a
-/// mutable error flag for load-failure feedback.
+/// stable [id] (so it can be tracked across reordering/removal), a
+/// mutable error flag for load-failure feedback, and lazily-extracted
+/// embedded album artwork (see [PlayerController._loadAlbumArtForItem]).
 class QueueItem {
   final int id;
   final PlatformFile file;
   bool hasError;
+
+  /// Embedded album artwork extracted from the audio file, if any was
+  /// found. Null until extraction has been attempted (see
+  /// [albumArtChecked]) or if the file simply has no embedded artwork.
+  /// Deliberately NOT persisted alongside the rest of the queue's
+  /// metadata — it's cheap enough to re-extract on next launch, and
+  /// keeping raw image bytes out of shared_preferences avoids bloating
+  /// that storage significantly.
+  Uint8List? albumArt;
+
+  /// Whether album art extraction has already been attempted for this
+  /// item, so [PlayerController._loadAlbumArtForItem] doesn't repeatedly
+  /// retry a file that's already been checked and simply has no artwork.
+  bool albumArtChecked = false;
 
   QueueItem({
     required this.id,
@@ -273,6 +290,17 @@ String describeError(Object error) {
 /// ordering. Manually selecting a track from the Queue screen while
 /// shuffle is active correctly re-syncs the shuffle cursor to that
 /// track's position, so subsequent Next/Previous taps stay consistent.
+///
+/// ## Album art
+/// Whenever a track is added to the queue (freshly picked, or restored
+/// from a previous session), embedded album artwork extraction is
+/// kicked off in the background via `metadata_god` (see
+/// [_loadAlbumArtForItem]). This never blocks queue mutations or
+/// playback — each item's [QueueItem.albumArt] simply populates
+/// asynchronously and the UI picks it up via the normal
+/// [notifyListeners] mechanism once available. Files with no embedded
+/// artwork, or that fail to parse for metadata purposes, are treated as
+/// a normal "no artwork" outcome rather than a user-facing error.
 class PlayerController extends ChangeNotifier {
   final AudioPlayer player = AudioPlayer();
 
@@ -690,6 +718,31 @@ class PlayerController extends ChangeNotifier {
     _shuffleCursor = ids.isEmpty ? -1 : 0;
   }
 
+  /// Extracts embedded album artwork for [item] via metadata_god, if not
+  /// already attempted. Failures (unsupported format, corrupt tags, no
+  /// artwork present, etc.) are treated as a normal "no artwork" outcome
+  /// rather than a user-facing error — this is a purely cosmetic
+  /// enhancement, and playback itself is entirely unaffected either way.
+  Future<void> _loadAlbumArtForItem(QueueItem item) async {
+    if (item.albumArtChecked) return;
+
+    final path = item.file.path;
+    if (path == null) {
+      item.albumArtChecked = true;
+      return;
+    }
+
+    try {
+      final metadata = await MetadataGod.readMetadata(file: path);
+      item.albumArt = metadata.picture?.data;
+    } catch (_) {
+      item.albumArt = null;
+    } finally {
+      item.albumArtChecked = true;
+      notifyListeners();
+    }
+  }
+
   /// Returns (creating if necessary) the app-owned permanent directory
   /// used to store copies of picked audio files. Cached after first
   /// resolution for the lifetime of this controller.
@@ -793,6 +846,15 @@ class PlayerController extends ChangeNotifier {
         if (_queue.isNotEmpty) {
           _nextId = _queue.map((item) => item.id).reduce(math.max) + 1;
         }
+
+        // Kick off album art extraction for restored tracks that still
+        // resolve to a real file on disk; items already flagged
+        // hasError skip extraction since there's nothing to read.
+        for (final item in _queue) {
+          if (!item.hasError) {
+            unawaited(_loadAlbumArtForItem(item));
+          }
+        }
       }
     } catch (e) {
       _emitError('Failed to restore saved queue: ${describeError(e)}');
@@ -866,6 +928,13 @@ class PlayerController extends ChangeNotifier {
       }
       notifyListeners();
       unawaited(_persistQueue());
+
+      // Kick off album art extraction for the newly added tracks in the
+      // background; each one calls notifyListeners() individually once
+      // its artwork (or lack thereof) is determined.
+      for (final item in newItems) {
+        unawaited(_loadAlbumArtForItem(item));
+      }
 
       if (wasQueueEmpty && newItems.isNotEmpty) {
         await loadTrackById(newItems.first.id, autoPlay: false);

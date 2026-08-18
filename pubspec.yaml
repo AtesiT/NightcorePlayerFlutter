@@ -16,10 +16,10 @@ dependencies:
   shared_preferences: ^2.3.2
   permission_handler: ^11.3.1
   path_provider: ^2.1.4
-  # Explicit dependency for configuring the audio session category and
-  # reacting to interruptions (calls, other apps, headphone removal) —
-  # see PlayerController's audio session handling.
   audio_session: ^0.1.21
+  # Extracts embedded album artwork (and other metadata) from audio
+  # files, for display in the Player and Queue screens.
+  metadata_god: ^0.5.4
   cupertino_icons: ^1.0.8
 
 dev_dependencies:
